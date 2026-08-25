@@ -1,9 +1,21 @@
 # Gradle files
 .gradle/
 build/
-
-# Local configuration file (sdk path, etc)
+**/build/
 local.properties
+
+# Local credentials and signing material
+*.keystore
+*.jks
+secrets.env
+google-services.json
+
+# IDE and generated files
+.idea/
+*.iml
+.externalNativeBuild/
+.cxx/
+
 
 # Log/OS Files
 *.log

@@ -1,139 +1,122 @@
-# Telegram-клиент для Android
+# Glazegram
 
-Независимый Telegram-клиент для Android, разрабатываемый с нуля на базе TDLib.
+> Независимый Telegram-клиент для Android, создаваемый с нуля на базе TDLib.
 
-Проект не является форком официального Telegram для Android. Клиент использует TDLib для взаимодействия с Telegram и имеет собственную архитектуру и интерфейс.
-
-## Цели проекта
-
-Основная цель — создать полноценный Telegram-клиент для Android с большим упором на кастомизацию интерфейса и поведения приложения.
-
-В дальнейшем планируются несколько независимых вариантов оформления:
-
-* iOS-like;
-* Material Design;
-* Liquid Glass;
-* гибкая настройка интерфейса;
-* пользовательские темы и пресеты.
-
-Также планируется добавление собственных функций поверх возможностей Telegram.
-
-## Текущая стадия
-
-Сейчас проект находится на этапе разработки основного функционала.
-
-Приоритет:
-
-* интеграция TDLib;
-* авторизация;
-* работа с аккаунтом;
-* список чатов;
-* просмотр истории сообщений;
-* получение новых сообщений;
-* отправка сообщений;
-* работа с медиа;
-* поиск;
-* группы и каналы;
-* уведомления;
-* стабильная работа приложения.
-
-Финальный дизайн и глубокая кастомизация будут реализовываться позже.
-
-## Платформа
-
-Только Android.
-
-Поддержка iOS, Web и Desktop не планируется.
-
-## Технологии
-
-Основной стек:
-
-* Kotlin;
-* Android SDK;
-* Jetpack Compose;
-* TDLib;
-* Kotlin Coroutines;
-* Flow / StateFlow;
-* Gradle Kotlin DSL.
-
-## TDLib
-
-Для взаимодействия с Telegram используется официальная библиотека TDLib.
-
-TDLib отвечает за:
-
-* подключение к Telegram;
-* авторизацию;
-* получение обновлений;
-* синхронизацию;
-* локальное хранение Telegram-данных;
-* загрузку сообщений и медиа;
-* отправку сообщений.
-
-Приложение не использует Telegram Bot API.
-
-## Разработка
-
-Большая часть проекта разрабатывается с помощью AI coding agents.
-
-Основные инструкции для агентов находятся в:
-
-```text
-AGENTS.md
-```
-
-Дополнительные файлы совместимости:
-
-```text
-CLAUDE.md
-GEMINI.md
-```
-
-Перед внесением изменений агент должен ознакомиться с инструкциями проекта.
-
-## Документация
-
-```text
-README.md
-AGENTS.md
-ROADMAP.md
-ARCHITECTURE.md
-```
-
-### ROADMAP.md
-
-Содержит порядок реализации функций и текущие этапы разработки.
-
-### ARCHITECTURE.md
-
-Содержит описание фактически используемой архитектуры проекта.
-
-Файл должен обновляться при существенных архитектурных изменениях.
-
-### AGENTS.md
-
-Главный набор правил для AI-агентов, работающих с кодовой базой.
-
-## Принцип разработки
-
-Проект развивается постепенно.
-
-Необходимо сначала получить стабильный функциональный Telegram-клиент, и только после этого заниматься сложным визуальным оформлением и кастомизацией.
-
-Приоритет:
-
-```text
-работоспособность
-→ стабильность
-→ основные Telegram-функции
-→ дополнительные функции
-→ дизайн
-→ глубокая кастомизация
-```
+Glazegram не является форком официального Telegram-клиента. Проект использует TDLib для сетевого взаимодействия, авторизации, синхронизации и локального хранения Telegram-данных.
 
 ## Статус
 
-Проект находится в активной разработке.
+Версия `0.1.0-alpha.1` содержит функциональное ядро Android-клиента. Это ранняя alpha: основные потоки работают, но Telegram-функции и chat UI ещё неполны.
 
-API, архитектура и структура проекта могут значительно изменяться.
+- Android-проект на Kotlin и Jetpack Compose
+- Gradle Kotlin DSL и Gradle Wrapper
+- TDLib Android AAR с pinned-версией
+- TDLib authorization client и update flow
+- Вход по номеру телефона, коду и 2FA password
+- Logout и восстановление сессии через TDLib database
+- Список чатов с realtime updates, unread counters и pinned ordering
+- Chat titles, last message previews и TDLib avatar downloads
+- Local-first история, pagination и realtime message updates
+- Отправка текста, статусы pending/sent/read/failed и replies
+- Reply navigation, long-press actions Reply/Copy
+- Photo/video/document/audio preview models и media albums
+- Sender names/avatars, typing action, member/online counts
+- Permission-aware composer для read-only channels
+- Foreground TDLib service и resume reconciliation
+- Material 3 с dynamic Monet colors на Android 12+
+- Debug APK собирается успешно
+
+Не завершены notifications/push, search, profiles, contacts, reactions, edit/delete, production media mosaic, cross-chat reply navigation и полная Telegram content taxonomy. Возможны медленная первая server synchronization и ошибки media playback.
+
+## Стек
+
+| Компонент | Технология |
+| --- | --- |
+| Platform | Android |
+| Language | Kotlin |
+| UI | Jetpack Compose |
+| Telegram API | TDLib |
+| Async | Kotlin Coroutines |
+| Build | Gradle Kotlin DSL |
+| Min SDK | 23 |
+| Compile SDK | 36 |
+
+## Сборка
+
+Требования:
+
+- JDK 21
+- Android SDK с API 36
+- Android SDK Build-Tools 36
+
+Сборка debug APK:
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+Результат:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+Проверка проекта:
+
+```bash
+./gradlew :app:check
+```
+
+Если Android SDK не настроен глобально, перед сборкой укажи `ANDROID_HOME` или создай стандартный `local.properties`. `local.properties` не отслеживается Git.
+
+## Установка APK
+
+При подключённом Android-устройстве с включённой USB-отладкой:
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Либо APK можно открыть через файловый менеджер Android после передачи файла на устройство.
+
+## Credentials
+
+Реальные credentials не хранятся в репозитории.
+
+Создай локальный файл:
+
+```text
+~/.glazegram/secrets.env
+```
+
+Минимальное содержимое:
+
+```dotenv
+TELEGRAM_APP_ID=your_telegram_app_id
+TELEGRAM_APP_HASH=your_telegram_app_hash
+```
+
+Gradle читает значения в следующем порядке:
+
+1. Environment variables
+2. Gradle properties
+3. `~/.glazegram/secrets.env`
+
+Шаблон переменных находится в `secrets.env.example`. Файлы credentials, keystore и `google-services.json` исключены из Git.
+
+## Документация
+
+- `ARCHITECTURE.md` — фактически реализованная архитектура
+- `ROADMAP.md` — этапы разработки
+- `AGENTS.md` — правила проекта
+- `CLAUDE.md` и `GEMINI.md` — compatibility-инструкции для coding agents
+
+## Roadmap
+
+Текущий этап — завершение chat interaction foundation и стабилизация realtime/media behavior. Подробный фактический статус находится в `ROADMAP.md`.
+
+Тема использует Material 3 и Monet-палитру устройства. Дополнительные темы, Liquid Glass и глубокая кастомизация появятся после стабилизации функционального ядра.
+
+## Лицензия
+
+См. `LICENSE`.
