@@ -37,29 +37,24 @@ object TdLibRuntime {
     private val mutableAccount = MutableStateFlow<AccountSummary?>(null)
     val account: StateFlow<AccountSummary?> = mutableAccount.asStateFlow()
 
-    // Per-chat history coordination
-    enum class HistoryBoundary { UNKNOWN, CAN_LOAD, END_REACHED }
-    private data class HistoryState(
-        var initialReady: Boolean = false,
-        var initialLoading: Boolean = false,
-        var refreshing: Boolean = false,
-        var olderLoading: Boolean = false,
-        var boundary: HistoryBoundary = HistoryBoundary.UNKNOWN,
-        var generation: Int = 0,
-        var active: Boolean = false,
-        var warmupCooldownUntil: Long = 0L,
-    )
-    private val historyStates = HashMap<Long, HistoryState>()
-    private val pendingInitialMessages = HashMap<Long, MutableList<TdApi.Message>>()
-    private fun historyState(chatId: Long): HistoryState = historyStates.getOrPut(chatId) { HistoryState() }
+    /**
+     * Per-chat history coordination. `history`, [messageHistory] and the published history
+     * flags are only touched inside `history.withLock { }` — the UI thread calls in through
+     * [openChat]/[closeChat]/[loadOlderMessages]/[refreshChatHistory] while TDLib answers on
+     * its own threads.
+     */
+    private val history = HistoryCoordinator()
+
     private fun syncHistoryLoading(chatId: Long) {
-        val st = historyStates[chatId]
-        mutableHistoryLoading.value = mutableHistoryLoading.value + (chatId to (st?.olderLoading == true))
+        val state = history.peek(chatId) ?: return
+        mutableHistoryLoading.value =
+            mutableHistoryLoading.value + (chatId to state.isLoading(HistorySlot.OLDER))
     }
+
     private fun syncHistoryHasMore(chatId: Long) {
-        val st = historyStates[chatId]
-        val hasMore = st == null || st.boundary != HistoryBoundary.END_REACHED
-        mutableHistoryHasMore.value = mutableHistoryHasMore.value + (chatId to hasMore)
+        val state = history.peek(chatId) ?: return
+        mutableHistoryHasMore.value =
+            mutableHistoryHasMore.value + (chatId to (state.boundary != HistoryBoundary.END_REACHED))
     }
 
     @Volatile
@@ -84,12 +79,8 @@ object TdLibRuntime {
     private var currentUser: TdApi.User? = null
     private lateinit var preferences: android.content.SharedPreferences
 
-    // Process-local retention – bounded LRU, metadata only (no bitmap)
-    private val retentionOrder = LinkedHashMap<Long, Unit>(16, 0.75f, true)
-    private val MAX_RETAINED_CHATS = 8 // keep recent 8 chats
-    private val MAX_MESSAGES_PER_CHAT = 150 // cap per chat to bound memory
-    private val INITIAL_PAGE_SIZE = 50
-    private val RETAINED_VIEWPORT_THRESHOLD = 20 // usable viewport if >=20 messages retained
+    // Process-local retention – bounded LRU, metadata only (no bitmap). Retention order and
+    // per-chat coordination live in `history`; the messages themselves in messageHistory.
 
     fun initialize(context: Context) {
         if (initialized) return
@@ -186,29 +177,21 @@ object TdLibRuntime {
 
     fun openChat(chatId: Long) {
         send(TdApi.OpenChat(chatId))
-        val st = historyState(chatId)
-        st.active = true
-        touchRetention(chatId)
-        // Do not use messageHistory existence as readiness
-        if (st.initialReady) {
-            val existingSize = messageHistory[chatId]?.size ?: 0
-            val cacheHit = existingSize >= RETAINED_VIEWPORT_THRESHOLD
-            GlazeLog.historyOpen(chatId, cacheHit, retentionOrder.size)
-            // Render retained immediately (already in StateFlow), but still refresh lightly
-            if (!st.initialLoading && !st.refreshing) {
-                scheduleRefresh(chatId)
+        history.withLock {
+            val state = history.open(chatId)
+            touchRetention(chatId)
+            val retained = messageHistory[chatId]?.size ?: 0
+            val cacheHit = retained >= HistoryPolicy.RETAINED_VIEWPORT_THRESHOLD
+            GlazeLog.historyOpen(chatId, cacheHit, history.retainedChats())
+            when {
+                // Retained viewport is already published; refresh it lightly.
+                state.initialReady -> scheduleRefresh(chatId)
+                state.isLoading(HistorySlot.INITIAL) ->
+                    GlazeLog.paginationSuppressed(chatId, "openChat already initialLoading")
+                // Cold open: bounded local-first initial page (no single-message floating).
+                else -> loadInitial(chatId)
             }
-            return
         }
-        if (st.initialLoading) {
-            GlazeLog.paginationSuppressed(chatId, "openChat already initialLoading")
-            return
-        }
-        val existingSize = messageHistory[chatId]?.size ?: 0
-        val cacheHit = existingSize >= RETAINED_VIEWPORT_THRESHOLD
-        GlazeLog.historyOpen(chatId, cacheHit, retentionOrder.size)
-        // Cold open: bounded local-first initial page (no single-message floating)
-        loadInitial(chatId)
     }
 
     fun refreshChats() {
@@ -221,88 +204,77 @@ object TdLibRuntime {
     }
 
     fun refreshChatHistory(chatId: Long) {
-        if (mutableState.value == AuthUiState.Ready) {
-            scheduleRefresh(chatId)
-        }
+        if (mutableState.value != AuthUiState.Ready) return
+        history.withLock { scheduleRefresh(chatId) }
     }
 
     fun closeChat(chatId: Long) {
         send(TdApi.CloseChat(chatId))
-        val st = historyStates[chatId]
-        if (st != null) st.active = false
-        // Compact retained history to newest MAX on close (active can grow unbounded while open)
-        val arr = messageHistory[chatId]
-        if (arr != null && arr.size > MAX_MESSAGES_PER_CHAT) {
-            val trimmed = arr.take(MAX_MESSAGES_PER_CHAT).toTypedArray()
-            messageHistory[chatId] = trimmed
-            publishMessages(chatId)
-            GlazeLog.d("History/Retention", "compact chatId=$chatId size=${trimmed.size}")
+        history.withLock {
+            history.setActive(chatId, false)
+            // An open chat may grow past the cap while paginating; compact it once it is closed.
+            if (trimHistoryIfInactive(chatId)) publishMessages(chatId)
         }
         // allow LRU to evict only inactive
     }
 
     fun loadOlderMessages(chatId: Long) {
-        val st = historyState(chatId)
-        if (st.olderLoading) {
-            GlazeLog.paginationSuppressed(chatId, "older already loading")
-            return
+        history.withLock {
+            val blocked = history.olderRequestBlocked(chatId)
+            if (blocked != null) {
+                GlazeLog.paginationSuppressed(chatId, blocked)
+                return@withLock
+            }
+            val anchorId = HistoryMerge.oldestId(messageHistory[chatId] ?: emptyArray())
+            if (anchorId == null) {
+                GlazeLog.paginationSuppressed(chatId, "no older anchor")
+                return@withLock
+            }
+            val request = history.begin(chatId, HistorySlot.OLDER) ?: return@withLock
+            touchRetention(chatId)
+            syncHistoryLoading(chatId)
+            val startedAt = SystemClock.elapsedRealtime()
+            send(
+                TdApi.GetChatHistory(chatId, anchorId, 0, HistoryPolicy.INITIAL_PAGE_SIZE, false),
+                result = { result ->
+                    history.withLock {
+                        if (history.owner(request) == null) {
+                            GlazeLog.paginationSuppressed(chatId, "stale older response")
+                            return@withLock
+                        }
+                        val messages = (result as? TdApi.Messages)?.messages
+                        if (messages == null) {
+                            history.finish(request)
+                            syncHistoryLoading(chatId)
+                            return@withLock
+                        }
+                        // Progress is measured against the anchor, never against the page size.
+                        val older = messages.filter { HistoryPolicy.isOlderThan(anchorId, it.id) }
+                        if (older.isNotEmpty()) mergeMessages(chatId, older, HistoryLoadSource.OLDER)
+                        val boundary = history.completeOlder(request, older.size)
+                        syncHistoryLoading(chatId)
+                        syncHistoryHasMore(chatId)
+                        GlazeLog.historyOlder(
+                            chatId = chatId,
+                            fromId = anchorId,
+                            count = messages.size,
+                            olderCount = older.size,
+                            endReached = boundary == HistoryBoundary.END_REACHED,
+                            latencyMs = SystemClock.elapsedRealtime() - startedAt,
+                        )
+                    }
+                },
+                onFailure = { error ->
+                    history.withLock {
+                        // Transport failure is not an end of history: release the slot, keep the boundary.
+                        if (history.finish(request)) {
+                            GlazeLog.e("History/Older", "chatId=$chatId failed: $error")
+                            syncHistoryLoading(chatId)
+                        }
+                    }
+                },
+            )
         }
-        if (st.boundary == HistoryBoundary.END_REACHED) {
-            GlazeLog.paginationSuppressed(chatId, "endReached")
-            return
-        }
-        if (!st.initialReady) {
-            GlazeLog.paginationSuppressed(chatId, "not initialReady")
-            return
-        }
-        val oldestMessageId = messageHistory[chatId]?.lastOrNull()?.id ?: return
-        touchRetention(chatId)
-        st.olderLoading = true
-        st.generation += 1
-        val gen = st.generation
-        syncHistoryLoading(chatId)
-        val t0 = SystemClock.elapsedRealtime()
-        val existingIds = messageHistory[chatId]?.map { it.id }?.toHashSet() ?: emptySet()
-        send(
-            TdApi.GetChatHistory(chatId, oldestMessageId, 0, INITIAL_PAGE_SIZE, false),
-            result = { result ->
-                if (historyState(chatId).generation != gen) {
-                    GlazeLog.paginationSuppressed(chatId, "stale older gen=$gen")
-                    return@send
-                }
-                val history = result as? TdApi.Messages ?: run {
-                    st.olderLoading = false; syncHistoryLoading(chatId); return@send
-                }
-                val count = history.messages.size
-                // progress = new older IDs not previously present
-                val newOlderIds = history.messages.count { it.id !in existingIds }
-                val hasProgress = newOlderIds > 0
-                if (hasProgress) {
-                    // merge without media? for older pagination we want media as visible, allow media
-                    mergeMessages(chatId, history.messages, requestMedia = true)
-                }
-                val endReached = !hasProgress && count == 0 // only when no new IDs and empty, per TDLib may return <50 even with more, so don't use count==limit
-                // Alternative: if count==0 -> end, else if no progress but count>0 could still be end, but we conservatively keep CAN_LOAD
-                // Use official rule: end only when no progress and count==0 or all duplicates
-                if (endReached) {
-                    st.boundary = HistoryBoundary.END_REACHED
-                } else if (hasProgress) {
-                    st.boundary = HistoryBoundary.CAN_LOAD
-                }
-                st.olderLoading = false
-                syncHistoryLoading(chatId)
-                syncHistoryHasMore(chatId)
-                val latency = SystemClock.elapsedRealtime() - t0
-                GlazeLog.historyOlder(chatId, oldestMessageId, count, st.boundary == HistoryBoundary.END_REACHED, latency)
-            },
-            onFailure = { error ->
-                if (historyState(chatId).generation != gen) return@send
-                try { Log.e("TdLibHistory", "older chat=$chatId failed: $error") } catch (_: RuntimeException) {}
-                st.olderLoading = false
-                syncHistoryLoading(chatId)
-                GlazeLog.paginationSuppressed(chatId, "older request failed")
-            },
-        )
     }
 
     fun sendTextMessage(chatId: Long, text: String, replyToMessageId: Long? = null): Boolean {
@@ -322,7 +294,11 @@ object TdLibRuntime {
             ),
             result = { result ->
                 val message = result as? TdApi.Message ?: return@send
-                if (message.id !in finalizedTemporaryMessageIds) mergeMessages(chatId, arrayOf(message))
+                history.withLock {
+                    if (message.id !in finalizedTemporaryMessageIds) {
+                        mergeMessages(chatId, listOf(message), HistoryLoadSource.REALTIME)
+                    }
+                }
             },
         )
         return true
@@ -347,11 +323,14 @@ object TdLibRuntime {
                 send(
                     TdApi.GetChatHistory(chatId, messageId, -19, 33, false),
                     result = { historyResponse ->
-                        val history = historyResponse as? TdApi.Messages
-                        if (history == null) result(false)
-                        else {
-                            mergeMessages(chatId, history.messages)
-                            result(messageHistory[chatId].orEmpty().any { it.id == messageId })
+                        val messages = (historyResponse as? TdApi.Messages)?.messages
+                        if (messages == null) {
+                            result(false)
+                        } else {
+                            history.withLock {
+                                mergeMessages(chatId, messages.asList(), HistoryLoadSource.CONTEXT)
+                                result(messageHistory[chatId].orEmpty().any { it.id == messageId })
+                            }
                         }
                     },
                     onFailure = { result(false) },
@@ -362,185 +341,151 @@ object TdLibRuntime {
     }
 
     fun downloadMessageMedia(chatId: Long, messageId: Long) {
-        val message = messageHistory[chatId]?.firstOrNull { it.id == messageId } ?: return
+        val message = history.withLock { messageHistory[chatId]?.firstOrNull { it.id == messageId } } ?: return
         messageMediaFile(message.content)?.let { requestFile(it, priority = 32) }
     }
 
+    /** Caller holds the history lock. */
     private fun scheduleRefresh(chatId: Long) {
-        val st = historyState(chatId)
-        if (st.refreshing || st.initialLoading) return
-        st.refreshing = true
-        st.generation += 1
-        val gen = st.generation
-        val tNet = SystemClock.elapsedRealtime()
+        val state = history.peek(chatId) ?: return
+        if (state.isLoading(HistorySlot.INITIAL)) return
+        val request = history.begin(chatId, HistorySlot.REFRESH) ?: return
+        val startedAt = SystemClock.elapsedRealtime()
         send(
-            TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, false),
-            result = { netResult ->
-                if (historyState(chatId).generation != gen) return@send
-                val net = netResult as? TdApi.Messages
-                val netCount = net?.messages?.size ?: 0
-                if (netCount > 0 && net != null) mergeMessages(chatId, net.messages)
-                st.refreshing = false
-                // do not change initialReady, keep boundary as is (UNKNOWN/CAN_LOAD)
-                if (st.boundary == HistoryBoundary.UNKNOWN && netCount > 0) st.boundary = HistoryBoundary.CAN_LOAD
-                syncHistoryHasMore(chatId)
-                val latency = SystemClock.elapsedRealtime() - tNet
-                GlazeLog.historyNetwork(chatId, netCount, latency, false)
-            },
-            onFailure = { err ->
-                if (historyState(chatId).generation != gen) return@send
-                try { Log.e("TdLibHistory", "refresh chat=$chatId failed: $err") } catch (_: RuntimeException) {}
-                st.refreshing = false
-            },
-        )
-    }
-
-    private fun loadInitial(chatId: Long) {
-        val st = historyState(chatId)
-        st.initialLoading = true
-        st.generation += 1
-        val gen = st.generation
-        // ensure not marked ready yet
-        val tLocal = SystemClock.elapsedRealtime()
-        send(
-            TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, true),
-            result = { localResult ->
-                if (historyState(chatId).generation != gen) return@send
-                val local = localResult as? TdApi.Messages
-                val localCount = local?.messages?.size ?: 0
-                val localLatency = SystemClock.elapsedRealtime() - tLocal
-                GlazeLog.historyLocal(chatId, localCount, localLatency)
-                // Merge local viewport immediately if any, but do not yet mark ready until network coheres
-                if (localCount > 0 && local != null) {
-                    mergeMessages(chatId, local.messages)
-                    // local page alone does not prove end; keep boundary UNKNOWN
-                    st.boundary = HistoryBoundary.UNKNOWN
-                    syncHistoryHasMore(chatId)
-                    // If local gave us a usable viewport, we could mark initialReady early to allow rendering,
-                    // but per spec we wait for first useful page – local counts as useful.
-                    // We will mark ready after local to allow immediate render, then still refresh network.
-                    // However to avoid floating single pending, we will mark ready here and merge pending later.
-                    st.initialReady = true
-                    // Also merge any pending realtime messages that arrived early
-                    val pending = pendingInitialMessages.remove(chatId)
-                    if (!pending.isNullOrEmpty()) {
-                        mergeMessages(chatId, pending.toTypedArray())
+            TdApi.GetChatHistory(chatId, 0, 0, HistoryPolicy.INITIAL_PAGE_SIZE, false),
+            result = { result ->
+                history.withLock {
+                    if (history.owner(request) == null) return@withLock
+                    val messages = (result as? TdApi.Messages)?.messages.orEmpty()
+                    if (messages.isNotEmpty()) {
+                        mergeMessages(chatId, messages.asList(), HistoryLoadSource.REFRESH)
+                        // Refresh never moves initialReady or the boundary beyond "history exists".
+                        history.markLoadableIfUnknown(chatId)
                     }
+                    history.finish(request)
+                    syncHistoryHasMore(chatId)
+                    GlazeLog.historyNetwork(
+                        chatId,
+                        messages.size,
+                        SystemClock.elapsedRealtime() - startedAt,
+                        false,
+                    )
                 }
-                // 2. network page to refresh/fill
-                val tNet = SystemClock.elapsedRealtime()
-                send(
-                    TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, false),
-                    result = { netResult ->
-                        if (historyState(chatId).generation != gen) return@send
-                        val net = netResult as? TdApi.Messages
-                        val netCount = net?.messages?.size ?: 0
-                        if (netCount > 0 && net != null) mergeMessages(chatId, net.messages)
-                        // Merge any additional pending that arrived during network
-                        val pending2 = pendingInitialMessages.remove(chatId)
-                        if (!pending2.isNullOrEmpty()) mergeMessages(chatId, pending2.toTypedArray())
-                        st.initialReady = true
-                        st.initialLoading = false
-                        // Short page with progress != endReached – keep UNKNOWN/CAN_LOAD, not END
-                        // Only mark END if we truly got zero and no progress
-                        if (localCount == 0 && netCount == 0) {
-                            st.boundary = HistoryBoundary.END_REACHED
-                        } else {
-                            if (st.boundary == HistoryBoundary.UNKNOWN) st.boundary = HistoryBoundary.CAN_LOAD
-                        }
-                        syncHistoryHasMore(chatId)
-                        val latency = SystemClock.elapsedRealtime() - tNet
-                        GlazeLog.historyNetwork(chatId, netCount, latency, st.boundary == HistoryBoundary.END_REACHED)
-                    },
-                    onFailure = { err ->
-                        if (historyState(chatId).generation != gen) return@send
-                        try { Log.e("TdLibHistory", "initial network chat=$chatId failed: $err") } catch (_: RuntimeException) {}
-                        // If we had local, we are already ready
-                        if (localCount > 0) {
-                            st.initialReady = true
-                            st.initialLoading = false
-                            if (st.boundary == HistoryBoundary.UNKNOWN) st.boundary = HistoryBoundary.CAN_LOAD
-                            syncHistoryHasMore(chatId)
-                            val pending = pendingInitialMessages.remove(chatId)
-                            if (!pending.isNullOrEmpty()) mergeMessages(chatId, pending.toTypedArray())
-                        } else {
-                            st.initialLoading = false
-                            st.boundary = HistoryBoundary.END_REACHED
-                            syncHistoryHasMore(chatId)
-                        }
-                    },
-                )
             },
-            onFailure = { err ->
-                if (historyState(chatId).generation != gen) return@send
-                try { Log.e("TdLibHistory", "initial local chat=$chatId failed: $err") } catch (_: RuntimeException) {}
-                // fallback directly to network
-                val tNet = SystemClock.elapsedRealtime()
-                send(
-                    TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, false),
-                    result = { netResult ->
-                        if (historyState(chatId).generation != gen) return@send
-                        val net = netResult as? TdApi.Messages
-                        val netCount = net?.messages?.size ?: 0
-                        if (netCount > 0 && net != null) mergeMessages(chatId, net.messages)
-                        val pending = pendingInitialMessages.remove(chatId)
-                        if (!pending.isNullOrEmpty()) mergeMessages(chatId, pending.toTypedArray())
-                        st.initialReady = true
-                        st.initialLoading = false
-                        st.boundary = if (netCount == 0) HistoryBoundary.END_REACHED else HistoryBoundary.CAN_LOAD
-                        syncHistoryHasMore(chatId)
-                        val latency = SystemClock.elapsedRealtime() - tNet
-                        GlazeLog.historyNetwork(chatId, netCount, latency, st.boundary == HistoryBoundary.END_REACHED)
-                    },
-                    onFailure = { e2 ->
-                        if (historyState(chatId).generation != gen) return@send
-                        try { Log.e("TdLibHistory", "initial network fallback chat=$chatId failed: $e2") } catch (_: RuntimeException) {}
-                        st.initialLoading = false
-                        st.boundary = HistoryBoundary.END_REACHED
-                        syncHistoryHasMore(chatId)
-                    },
-                )
+            onFailure = { error ->
+                history.withLock {
+                    if (history.finish(request)) GlazeLog.e("History/Refresh", "chatId=$chatId failed: $error")
+                }
             },
         )
     }
 
+    /** Caller holds the history lock. */
+    private fun loadInitial(chatId: Long) {
+        val request = history.begin(chatId, HistorySlot.INITIAL) ?: return
+        val startedAt = SystemClock.elapsedRealtime()
+        send(
+            TdApi.GetChatHistory(chatId, 0, 0, HistoryPolicy.INITIAL_PAGE_SIZE, true),
+            result = { result ->
+                history.withLock {
+                    if (history.owner(request) == null) return@withLock
+                    val messages = (result as? TdApi.Messages)?.messages.orEmpty()
+                    GlazeLog.historyLocal(chatId, messages.size, SystemClock.elapsedRealtime() - startedAt)
+                    if (messages.isNotEmpty()) {
+                        // Local page renders immediately but never proves the boundary.
+                        mergeMessages(chatId, messages.asList(), HistoryLoadSource.INITIAL)
+                        publishInitialViewport(chatId, request)
+                    }
+                    loadInitialNetworkPage(chatId, request)
+                }
+            },
+            onFailure = { error ->
+                history.withLock {
+                    if (history.owner(request) == null) return@withLock
+                    GlazeLog.e("History/Initial", "local chatId=$chatId failed: $error")
+                    loadInitialNetworkPage(chatId, request)
+                }
+            },
+        )
+    }
+
+    /** Second stage of the same INITIAL request; caller holds the history lock. */
+    private fun loadInitialNetworkPage(chatId: Long, request: HistoryRequest) {
+        val startedAt = SystemClock.elapsedRealtime()
+        send(
+            TdApi.GetChatHistory(chatId, 0, 0, HistoryPolicy.INITIAL_PAGE_SIZE, false),
+            result = { result ->
+                history.withLock {
+                    if (history.owner(request) == null) return@withLock
+                    val messages = (result as? TdApi.Messages)?.messages.orEmpty()
+                    if (messages.isNotEmpty()) {
+                        mergeMessages(chatId, messages.asList(), HistoryLoadSource.INITIAL)
+                    }
+                    publishInitialViewport(chatId, request)
+                    val retained = messageHistory[chatId]?.size ?: 0
+                    val outcome =
+                        if (retained > 0) InitialOutcome.LOADED else InitialOutcome.EMPTY
+                    history.completeInitial(request, outcome)
+                    syncHistoryHasMore(chatId)
+                    GlazeLog.historyNetwork(
+                        chatId,
+                        messages.size,
+                        SystemClock.elapsedRealtime() - startedAt,
+                        history.peek(chatId)?.boundary == HistoryBoundary.END_REACHED,
+                    )
+                }
+            },
+            onFailure = { error ->
+                history.withLock {
+                    if (history.owner(request) == null) return@withLock
+                    GlazeLog.e("History/Initial", "network chatId=$chatId failed: $error")
+                    // Anything retained (local page) is a usable viewport; otherwise stay unready
+                    // and keep the buffered realtime messages for the next attempt.
+                    val retained = messageHistory[chatId]?.size ?: 0
+                    val outcome =
+                        if (retained > 0) InitialOutcome.LOADED else InitialOutcome.FAILED
+                    history.completeInitial(request, outcome)
+                    syncHistoryHasMore(chatId)
+                }
+            },
+        )
+    }
+
+    /**
+     * Marks the viewport publishable and folds in realtime messages that arrived before the
+     * first page, so they appear exactly once and never as a lone bubble.
+     * Caller holds the history lock.
+     */
+    private fun publishInitialViewport(chatId: Long, request: HistoryRequest) {
+        if (!history.markInitialReady(request)) return
+        val buffered = history.drainPending(chatId)
+        if (buffered.isNotEmpty()) {
+            GlazeLog.d("History/Realtime", "chatId=$chatId merged buffered=${buffered.size}")
+            mergeMessages(chatId, buffered, HistoryLoadSource.REALTIME)
+        }
+        syncHistoryHasMore(chatId)
+    }
+
+    /** Caller holds the history lock. */
     private fun touchRetention(chatId: Long) {
-        retentionOrder[chatId] = Unit
-        // evict only inactive retained chats, never active
-        while (retentionOrder.size > MAX_RETAINED_CHATS) {
-            val eldest = retentionOrder.keys.firstOrNull() ?: break
-            val st = historyStates[eldest]
-            if (st?.active == true) {
-                // skip active, try next
-                // move it to end to avoid loop
-                retentionOrder.remove(eldest)
-                retentionOrder[eldest] = Unit
-                // if all are active, break
-                if (retentionOrder.keys.all { historyStates[it]?.active == true }) break
-                continue
-            }
-            retentionOrder.remove(eldest)
-            historyStates.remove(eldest)
-            pendingInitialMessages.remove(eldest)
-            messageHistory.remove(eldest)
-            mutableMessages.value = mutableMessages.value - eldest
-            // clean loading/hasMore for evicted
-            mutableHistoryLoading.value = mutableHistoryLoading.value - eldest
-            mutableHistoryHasMore.value = mutableHistoryHasMore.value - eldest
-            GlazeLog.retentionEvict(eldest, retentionOrder.size)
+        for (evicted in history.touch(chatId)) {
+            messageHistory.remove(evicted)
+            mutableMessages.value = mutableMessages.value - evicted
+            mutableHistoryLoading.value = mutableHistoryLoading.value - evicted
+            mutableHistoryHasMore.value = mutableHistoryHasMore.value - evicted
+            GlazeLog.retentionEvict(evicted, history.retainedChats())
         }
     }
 
-    private fun trimHistoryIfInactive(chatId: Long) {
-        val st = historyStates[chatId]
-        if (st?.active == true) return
-        val arr = messageHistory[chatId] ?: return
-        if (arr.size > MAX_MESSAGES_PER_CHAT) {
-            val trimmed = arr.take(MAX_MESSAGES_PER_CHAT).toTypedArray()
-            messageHistory[chatId] = trimmed
-            publishMessages(chatId)
-            GlazeLog.d("History/Retention", "compact chatId=$chatId size=${trimmed.size}")
-        }
+    /** Returns true when the retained history was compacted. Caller holds the history lock. */
+    private fun trimHistoryIfInactive(chatId: Long): Boolean {
+        val retained = messageHistory[chatId] ?: return false
+        val active = history.peek(chatId)?.active == true
+        if (!HistoryPolicy.canTrim(active, retained.size)) return false
+        val trimmed = HistoryMerge.trimToNewest(retained, HistoryPolicy.MAX_MESSAGES_PER_CHAT)
+        messageHistory[chatId] = trimmed
+        GlazeLog.d("History/Retention", "compact chatId=$chatId size=${trimmed.size}")
+        return true
     }
 
     private lateinit var storageContext: Context
@@ -749,18 +694,19 @@ object TdLibRuntime {
         val error = resetError
         resetError = null
         authNotice = error
-        synchronized(chatMap) {
-            chatMap.clear()
-            users.clear()
-            basicGroups.clear()
-            supergroups.clear()
-            onlineMemberCounts.clear()
-            chatActions.clear()
-            messageHistory.clear()
+        // History lock first, then chatMap – the one lock order used everywhere.
+        history.withLock {
+            history.clear()
+            synchronized(chatMap) {
+                chatMap.clear()
+                users.clear()
+                basicGroups.clear()
+                supergroups.clear()
+                onlineMemberCounts.clear()
+                chatActions.clear()
+                messageHistory.clear()
+            }
         }
-        retentionOrder.clear()
-        historyStates.clear()
-        pendingInitialMessages.clear()
         pendingUserRequests.clear()
         finalizedTemporaryMessageIds.clear()
         currentUser = null
@@ -776,15 +722,21 @@ object TdLibRuntime {
 
     private fun upsertChat(result: TdApi.Object) {
         val chat = result as? TdApi.Chat ?: return
-        synchronized(chatMap) { chatMap[chat.id] = chat }
-        requestAvatar(chat)
-        requestMessageAuthor(chat.lastMessage)
-        requestChatMetadata(chat)
-        if (!suppressChatPublishing) publishChats()
-        messageHistory.keys.forEach(::publishMessages)
+        history.withLock {
+            synchronized(chatMap) { chatMap[chat.id] = chat }
+            requestAvatar(chat)
+            requestMessageAuthor(chat.lastMessage)
+            requestChatMetadata(chat)
+            if (!suppressChatPublishing) publishChats()
+            messageHistory.keys.toList().forEach(::publishMessages)
+        }
     }
 
-    private fun handleChatUpdate(update: TdApi.Update): Boolean {
+    /**
+     * History state is always taken before [chatMap] so the two locks keep one order across
+     * TDLib update threads, TDLib request callbacks and the UI thread.
+     */
+    private fun handleChatUpdate(update: TdApi.Update): Boolean = history.withLock {
         synchronized(chatMap) {
             when (update) {
                 is TdApi.UpdateNewChat -> chatMap[update.chat.id] = update.chat
@@ -806,14 +758,14 @@ object TdLibRuntime {
                 }
                 is TdApi.UpdateMessageMentionRead -> {
                     chatMap[update.chatId]?.unreadMentionCount = update.unreadMentionCount
-                    messageHistory[update.chatId] = messageHistory[update.chatId]
-                        ?.map { message ->
+                    val retained = messageHistory[update.chatId]
+                    if (retained != null) {
+                        messageHistory[update.chatId] = retained.map { message ->
                             if (message.id == update.messageId) message.apply { containsUnreadMention = false }
                             else message
-                        }
-                        ?.toTypedArray()
-                        ?: emptyArray()
-                    publishMessages(update.chatId)
+                        }.toTypedArray()
+                        publishMessages(update.chatId)
+                    }
                 }
                 is TdApi.UpdateChatPermissions -> chatMap[update.chatId]?.permissions = update.permissions
                 is TdApi.UpdateUser -> {
@@ -844,28 +796,26 @@ object TdLibRuntime {
                 }
                 is TdApi.UpdateNewMessage -> {
                     val chatId = update.message.chatId
-                    val st = historyStates[chatId]
-                    // If chat has never had initial viewport, buffer realtime update but do not publish lone bubble
-                    if (st != null && !st.initialReady) {
-                        // Preserve for coherent viewport
-                        val pending = pendingInitialMessages.getOrPut(chatId) { mutableListOf() }
-                        // deduplicate by id
-                        if (pending.none { it.id == update.message.id } && messageHistory[chatId]?.none { it.id == update.message.id } == true) {
-                            pending.add(update.message)
+                    val retained = messageHistory[chatId]
+                    val decision = history.classifyRealtime(
+                        chatId = chatId,
+                        messageId = update.message.id,
+                        alreadyRetained = retained?.any { it.id == update.message.id } == true,
+                        hasRetainedHistory = retained != null,
+                    )
+                    when (decision) {
+                        RealtimeDecision.MERGE ->
+                            mergeMessages(chatId, listOf(update.message), HistoryLoadSource.REALTIME)
+                        // Before the first page: hold the message back instead of publishing a
+                        // lone bubble. Drained by publishInitialViewport.
+                        RealtimeDecision.BUFFER -> {
+                            history.buffer(chatId, update.message)
+                            GlazeLog.d(
+                                "History/Realtime",
+                                "chatId=$chatId buffered pending=${history.pendingCount(chatId)}",
+                            )
                         }
-                        // Also ensure chat appears in retention for quick open, but not as ready viewport
-                        messageHistory.putIfAbsent(chatId, emptyArray())
-                        retentionOrder[chatId] = Unit
-                    } else {
-                        val existing = messageHistory[chatId]
-                        if (existing != null) {
-                            mergeMessages(chatId, arrayOf(update.message))
-                        } else {
-                            // Chat not yet loaded but already ready? keep pending
-                            val pending = pendingInitialMessages.getOrPut(chatId) { mutableListOf() }
-                            pending.add(update.message)
-                            messageHistory.putIfAbsent(chatId, emptyArray())
-                        }
+                        RealtimeDecision.DROP -> Unit
                     }
                 }
                 is TdApi.UpdateMessageSendSucceeded -> {
@@ -877,22 +827,23 @@ object TdLibRuntime {
                     replaceMessage(update.message.chatId, update.oldMessageId, update.message)
                 }
                 is TdApi.UpdateMessageContent -> {
-                    messageHistory[update.chatId] = messageHistory[update.chatId]
-                        ?.map { message ->
+                    // Only chats whose history we retain; never materialize an empty viewport.
+                    val retained = messageHistory[update.chatId]
+                    if (retained != null) {
+                        messageHistory[update.chatId] = retained.map { message ->
                             if (message.id == update.messageId) message.apply { content = update.newContent }
                             else message
-                        }
-                        ?.toTypedArray()
-                        ?: emptyArray()
-                    publishMessages(update.chatId)
+                        }.toTypedArray()
+                        publishMessages(update.chatId)
+                    }
                 }
                 is TdApi.UpdateDeleteMessages -> {
-                    val deletedIds = update.messageIds.toHashSet()
-                    messageHistory[update.chatId] = messageHistory[update.chatId]
-                        ?.filterNot { it.id in deletedIds }
-                        ?.toTypedArray()
-                        ?: emptyArray()
-                    publishMessages(update.chatId)
+                    val retained = messageHistory[update.chatId]
+                    if (retained != null) {
+                        val deletedIds = update.messageIds.toHashSet()
+                        messageHistory[update.chatId] = retained.filterNot { it.id in deletedIds }.toTypedArray()
+                        publishMessages(update.chatId)
+                    }
                 }
                 is TdApi.UpdateChatReadOutbox -> {
                     chatMap[update.chatId]?.lastReadOutboxMessageId = update.lastReadOutboxMessageId
@@ -902,7 +853,7 @@ object TdLibRuntime {
                     chatMap[update.chatId]?.notificationSettings = update.notificationSettings
                 }
                 is TdApi.UpdateFile -> updateAvatar(update.file)
-                else -> return false
+                else -> return@withLock false
             }
         }
         if (update is TdApi.UpdateNewChat) {
@@ -911,70 +862,83 @@ object TdLibRuntime {
             requestChatMetadata(update.chat)
         }
         if (!suppressChatPublishing) publishChats()
-        return true
+        true
     }
 
     // Background warmup – bounded, local only, coordinated with history state
-    @Volatile private var warmupInFlight = false
+    private var warmupInFlight = false
+
     private fun maybeWarmupRecentChats() {
-        if (warmupInFlight) return
         if (mutableState.value != AuthUiState.Ready) return
-        val now = SystemClock.elapsedRealtime()
-        val top = mutableChats.value.take(3)
-        val candidates = top.filter {
-            val st = historyStates[it.id]
-            val notActive = st?.active != true
-            val notLoading = st?.initialLoading != true && st?.refreshing != true && st?.olderLoading != true
-            val need = (messageHistory[it.id]?.size ?: 0) < 10
-            val cooldownOk = (st?.warmupCooldownUntil ?: 0L) < now
-            notActive && notLoading && need && cooldownOk
+        history.withLock {
+            if (warmupInFlight) return@withLock
+            val now = SystemClock.elapsedRealtime()
+            val candidates = mutableChats.value.take(3).map { it.id }.filter { warmupNeeded(it, now) }.take(2)
+            if (candidates.isEmpty()) return@withLock
+            warmupInFlight = true
+            GlazeLog.warmup("start", "candidates=$candidates")
+            warmupNext(candidates, 0)
         }
-        if (candidates.isEmpty()) return
-        warmupInFlight = true
-        GlazeLog.warmup("start", "candidates=${candidates.map { it.id }}")
-        fun warmNext(index: Int) {
-            if (index >= candidates.size || index >= 2) {
-                warmupInFlight = false
-                GlazeLog.warmup("end", "warmed $index chats retained=${retentionOrder.size}")
-                return
-            }
-            val chatId = candidates[index].id
-            val st = historyState(chatId)
-            if (st.active || st.initialLoading || st.refreshing) {
-                warmNext(index + 1); return
-            }
-            if ((messageHistory[chatId]?.size ?: 0) >= 10) {
-                warmNext(index + 1); return
-            }
-            // per-chat generation for warmup
-            val gen = st.generation
-            send(
-                TdApi.GetChatHistory(chatId, 0, 0, 20, true),
-                result = { res ->
-                    if (historyState(chatId).generation != gen) { warmNext(index + 1); return@send }
-                    val msgs = (res as? TdApi.Messages)?.messages
-                    if (!msgs.isNullOrEmpty()) {
-                        mergeMessagesNoMedia(chatId, msgs)
-                        // Do not mark initialReady from warmup alone; keep UNKNOWN/CAN_LOAD
-                        if (historyState(chatId).boundary == HistoryBoundary.UNKNOWN) {
-                            historyState(chatId).boundary = HistoryBoundary.CAN_LOAD
+    }
+
+    /** Caller holds the history lock. */
+    private fun warmupNeeded(chatId: Long, nowMs: Long): Boolean =
+        history.warmupAllowed(chatId, nowMs) &&
+            (messageHistory[chatId]?.size ?: 0) < HistoryPolicy.WARMUP_MIN_MESSAGES
+
+    /** Caller holds the history lock. */
+    private fun warmupNext(candidates: List<Long>, index: Int) {
+        if (index >= candidates.size) {
+            warmupInFlight = false
+            GlazeLog.warmup("end", "warmed=$index retained=${history.retainedChats()}")
+            return
+        }
+        val chatId = candidates[index]
+        if (!warmupNeeded(chatId, SystemClock.elapsedRealtime())) {
+            warmupNext(candidates, index + 1)
+            return
+        }
+        history.ensure(chatId)
+        val request = history.begin(chatId, HistorySlot.WARMUP) ?: run {
+            warmupNext(candidates, index + 1)
+            return
+        }
+        send(
+            TdApi.GetChatHistory(chatId, 0, 0, HistoryPolicy.WARMUP_PAGE_SIZE, true),
+            result = { result ->
+                history.withLock {
+                    // An evicted or reopened chat kills the callback; the chain still continues.
+                    if (history.owner(request) != null) {
+                        val messages = (result as? TdApi.Messages)?.messages.orEmpty()
+                        if (messages.isNotEmpty()) {
+                            // Warmup never marks initialReady and never prefetches media.
+                            mergeMessages(chatId, messages.asList(), HistoryLoadSource.WARMUP)
+                            history.markLoadableIfUnknown(chatId)
                             syncHistoryHasMore(chatId)
+                        } else {
+                            history.holdWarmup(
+                                chatId,
+                                SystemClock.elapsedRealtime() + HistoryPolicy.WARMUP_COOLDOWN_MS,
+                            )
                         }
-                    } else {
-                        // empty local result – cooldown to avoid retry on every publishChats
-                        st.warmupCooldownUntil = SystemClock.elapsedRealtime() + 60_000
+                        history.finish(request)
                     }
-                    warmNext(index + 1)
-                },
-                onFailure = {
-                    if (historyState(chatId).generation == gen) {
-                        st.warmupCooldownUntil = SystemClock.elapsedRealtime() + 60_000
+                    warmupNext(candidates, index + 1)
+                }
+            },
+            onFailure = {
+                history.withLock {
+                    if (history.owner(request) != null) {
+                        history.holdWarmup(
+                            chatId,
+                            SystemClock.elapsedRealtime() + HistoryPolicy.WARMUP_COOLDOWN_MS,
+                        )
+                        history.finish(request)
                     }
-                    warmNext(index + 1)
-                },
-            )
-        }
-        warmNext(0)
+                    warmupNext(candidates, index + 1)
+                }
+            },
+        )
     }
 
     private fun publishChats() {
@@ -1107,10 +1071,12 @@ object TdLibRuntime {
     }
 
     private fun upsertUser(user: TdApi.User) {
-        users[user.id] = user
-        user.profilePhoto?.small?.let(::requestFile)
-        if (!suppressChatPublishing) publishChats()
-        messageHistory.keys.forEach(::publishMessages)
+        history.withLock {
+            synchronized(chatMap) { users[user.id] = user }
+            user.profilePhoto?.small?.let(::requestFile)
+            if (!suppressChatPublishing) publishChats()
+            messageHistory.keys.toList().forEach(::publishMessages)
+        }
     }
 
     private fun TdApi.User.displayName(): String = listOf(firstName, lastName)
@@ -1258,46 +1224,31 @@ object TdLibRuntime {
         }
     }
 
-    private fun mergeMessages(chatId: Long, messages: Array<TdApi.Message>, requestMedia: Boolean = true) {
-        val existing = messageHistory[chatId].orEmpty()
-        val merged = LinkedHashMap<Long, TdApi.Message>()
-        (existing.asList() + messages.asList()).forEach { merged[it.id] = it }
-        val sorted = merged.values.sortedWith(messageComparator).toTypedArray()
-        // Active chat can grow beyond retention cap; trim only on close/inactive
-        messageHistory[chatId] = sorted
-        retentionOrder[chatId] = Unit
-        // Evict only inactive chats via touchRetention (not here to avoid double)
+    /**
+     * Caller holds the history lock. Media prefetch follows [source]: warmup fills history
+     * only, so it must never pull files for chats the user has not opened.
+     */
+    private fun mergeMessages(chatId: Long, messages: List<TdApi.Message>, source: HistoryLoadSource) {
+        // An active chat may exceed the per-chat cap while paginating; trimming happens on close.
+        messageHistory[chatId] = HistoryMerge.merge(messageHistory[chatId] ?: emptyArray(), messages)
         touchRetention(chatId)
-        messages.forEach(::requestMessageAuthor)
-        messages.forEach(::requestForwardOrigin)
-        if (requestMedia) messages.forEach(::requestMessageMedia)
+        for (message in messages) {
+            requestMessageAuthor(message)
+            requestForwardOrigin(message)
+            if (source.requestsMedia) requestMessageMedia(message)
+        }
+        trimHistoryIfInactive(chatId)
         publishMessages(chatId)
     }
-    // for warmup: history only, no media
-    private fun mergeMessagesNoMedia(chatId: Long, messages: Array<TdApi.Message>) {
-        mergeMessages(chatId, messages, requestMedia = false)
-    }
 
+    /** Caller holds the history lock. */
     private fun replaceMessage(chatId: Long, oldMessageId: Long, message: TdApi.Message) {
-        val existing = messageHistory[chatId].orEmpty()
-        messageHistory[chatId] = (existing.filterNot { it.id == oldMessageId } + message)
-            .distinctBy { it.id }
-            .sortedWith(messageComparator)
-            .toTypedArray()
+        messageHistory[chatId] =
+            HistoryMerge.replace(messageHistory[chatId] ?: emptyArray(), oldMessageId, message)
         requestMessageAuthor(message)
         requestForwardOrigin(message)
         requestMessageMedia(message)
         publishMessages(chatId)
-    }
-
-    private val messageComparator = Comparator<TdApi.Message> { first, second ->
-        val firstPending = first.sendingState is TdApi.MessageSendingStatePending
-        val secondPending = second.sendingState is TdApi.MessageSendingStatePending
-        when {
-            firstPending != secondPending -> if (firstPending) -1 else 1
-            first.date != second.date -> second.date.compareTo(first.date)
-            else -> second.id.compareTo(first.id)
-        }
     }
 
     private fun loadCurrentUser() {

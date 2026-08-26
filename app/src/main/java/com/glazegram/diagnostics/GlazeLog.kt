@@ -9,6 +9,7 @@ object GlazeLog {
     private val startMs = System.currentTimeMillis()
     private const val PREFS = "glazegram_log"
     private const val KEY_LEVEL = "level"
+    private const val MAX_THROWABLE_MESSAGE = 160
 
     fun init(context: android.content.Context) {
         try {
@@ -29,15 +30,24 @@ object GlazeLog {
     fun d(tag: String, msg: String) = log("D", tag, msg, LogLevel.VERBOSE)
     fun i(tag: String, msg: String) = log("I", tag, msg, LogLevel.BASIC)
     fun w(tag: String, msg: String) = log("W", tag, msg, LogLevel.BASIC)
+
+    /**
+     * Errors reach Logcat exactly once, with the stack trace attached. The in-memory ring keeps a
+     * bounded one-line summary of the throwable so the diagnostics screen still shows what failed.
+     */
     fun e(tag: String, msg: String, tr: Throwable? = null) {
-        // log already forwards to Logcat once; do not duplicate
-        log("E", tag, msg, LogLevel.BASIC)
+        log("E", tag, msg + throwableSummary(tr), LogLevel.BASIC, tr)
     }
 
-    private fun log(lvl: String, tag: String, msg: String, required: LogLevel) {
+    private fun throwableSummary(tr: Throwable?): String {
+        if (tr == null) return ""
+        val cause = tr.message?.takeIf { it.isNotBlank() }?.let { ": " + it.take(MAX_THROWABLE_MESSAGE) }.orEmpty()
+        return " | ${tr.javaClass.simpleName}$cause"
+    }
+
+    private fun log(lvl: String, tag: String, msg: String, required: LogLevel, tr: Throwable? = null) {
         if (level == LogLevel.OFF) return
         if (required == LogLevel.VERBOSE && level != LogLevel.VERBOSE) return
-        if (required == LogLevel.BASIC && level == LogLevel.OFF) return
         val entry = LogEntry(System.currentTimeMillis() - startMs, lvl, tag, msg)
         buffer.add(entry)
         try {
@@ -45,7 +55,7 @@ object GlazeLog {
                 "D" -> Log.d(tag, msg)
                 "I" -> Log.i(tag, msg)
                 "W" -> Log.w(tag, msg)
-                "E" -> Log.e(tag, msg)
+                "E" -> if (tr != null) Log.e(tag, msg, tr) else Log.e(tag, msg)
             }
         } catch (_: RuntimeException) {
             // unit tests run without Android Log mocked – ignore
@@ -65,8 +75,13 @@ object GlazeLog {
     fun historyNetwork(chatId: Long, count: Int, latencyMs: Long, endReached: Boolean) {
         d("History/Network", "chatId=$chatId count=$count latencyMs=$latencyMs endReached=$endReached")
     }
-    fun historyOlder(chatId: Long, fromId: Long, count: Int, endReached: Boolean, latencyMs: Long) {
-        d("History/Older", "chatId=$chatId fromMessageId=$fromId count=$count endReached=$endReached latencyMs=$latencyMs")
+    /** [olderCount] is the progress actually made: how many returned messages were older than the anchor. */
+    fun historyOlder(chatId: Long, fromId: Long, count: Int, olderCount: Int, endReached: Boolean, latencyMs: Long) {
+        d(
+            "History/Older",
+            "chatId=$chatId fromMessageId=$fromId count=$count olderCount=$olderCount " +
+                "endReached=$endReached latencyMs=$latencyMs",
+        )
     }
     fun retentionEvict(chatId: Long, retained: Int) {
         i("History/Retention", "evict chatId=$chatId retainedChats=$retained")

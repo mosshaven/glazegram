@@ -42,11 +42,48 @@ class GlazeLogTest {
         GlazeLog.historyOpen(123L, true, 2)
         GlazeLog.historyLocal(123L, 50, 10)
         GlazeLog.historyNetwork(123L, 50, 20, false)
-        GlazeLog.historyOlder(123L, 999L, 20, false, 15)
+        GlazeLog.historyOlder(123L, 999L, 20, 17, false, 15)
         val msgs = GlazeLog.snapshot().joinToString { it.message }
         assertFalse(msgs.contains("secret"))
         assertTrue(msgs.contains("chatId=123"))
         GlazeLog.clear()
+        GlazeLog.level = LogLevel.BASIC
+    }
+
+    @Test
+    fun errorKeepsThrowableSummaryInTheRing() {
+        GlazeLog.level = LogLevel.BASIC
+        GlazeLog.clear()
+
+        GlazeLog.e("T", "load failed", IllegalStateException("client is gone"))
+
+        val entry = GlazeLog.snapshot().single()
+        assertEquals("E", entry.level)
+        assertTrue(entry.message.contains("load failed"))
+        assertTrue(entry.message.contains("IllegalStateException"))
+        assertTrue(entry.message.contains("client is gone"))
+        GlazeLog.clear()
+    }
+
+    @Test
+    fun errorWithoutThrowableIsUnchanged() {
+        GlazeLog.level = LogLevel.BASIC
+        GlazeLog.clear()
+
+        GlazeLog.e("T", "plain failure")
+
+        assertEquals("plain failure", GlazeLog.snapshot().single().message)
+        GlazeLog.clear()
+    }
+
+    @Test
+    fun errorsAreSuppressedWhenLoggingIsOff() {
+        GlazeLog.level = LogLevel.OFF
+        GlazeLog.clear()
+
+        GlazeLog.e("T", "ignored", RuntimeException("boom"))
+
+        assertTrue(GlazeLog.snapshot().isEmpty())
         GlazeLog.level = LogLevel.BASIC
     }
 }
