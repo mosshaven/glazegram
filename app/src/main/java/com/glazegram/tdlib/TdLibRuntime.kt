@@ -458,7 +458,9 @@ object TdLibRuntime {
      */
     private fun publishInitialViewport(chatId: Long, request: HistoryRequest) {
         if (!history.markInitialReady(request)) return
-        val buffered = history.drainPending(chatId)
+        // The published page holds the newest copy of anything it shares with the buffer.
+        val retainedIds = (messageHistory[chatId] ?: emptyArray()).mapTo(HashSet<Long>()) { it.id }
+        val buffered = history.drainPending(chatId, retainedIds)
         if (buffered.isNotEmpty()) {
             GlazeLog.d("History/Realtime", "chatId=$chatId merged buffered=${buffered.size}")
             mergeMessages(chatId, buffered, HistoryLoadSource.REALTIME)
@@ -484,6 +486,10 @@ object TdLibRuntime {
         if (!HistoryPolicy.canTrim(active, retained.size)) return false
         val trimmed = HistoryMerge.trimToNewest(retained, HistoryPolicy.MAX_MESSAGES_PER_CHAT)
         messageHistory[chatId] = trimmed
+        // The discarded messages only left process memory, so older history is reachable again.
+        history.onRetentionTrimmed(chatId)
+        syncHistoryLoading(chatId)
+        syncHistoryHasMore(chatId)
         GlazeLog.d("History/Retention", "compact chatId=$chatId size=${trimmed.size}")
         return true
     }
@@ -827,6 +833,9 @@ object TdLibRuntime {
                     replaceMessage(update.message.chatId, update.oldMessageId, update.message)
                 }
                 is TdApi.UpdateMessageContent -> {
+                    // A message may be retained, or still buffered awaiting the first page — an
+                    // edit has to reach whichever copy exists, or a stale body survives the drain.
+                    history.updatePendingContent(update.chatId, update.messageId, update.newContent)
                     // Only chats whose history we retain; never materialize an empty viewport.
                     val retained = messageHistory[update.chatId]
                     if (retained != null) {
@@ -838,9 +847,11 @@ object TdLibRuntime {
                     }
                 }
                 is TdApi.UpdateDeleteMessages -> {
+                    val deletedIds = update.messageIds.toHashSet()
+                    // Drop buffered copies too, so a drain can never resurrect a deleted message.
+                    history.removePending(update.chatId, deletedIds)
                     val retained = messageHistory[update.chatId]
                     if (retained != null) {
-                        val deletedIds = update.messageIds.toHashSet()
                         messageHistory[update.chatId] = retained.filterNot { it.id in deletedIds }.toTypedArray()
                         publishMessages(update.chatId)
                     }
@@ -899,6 +910,9 @@ object TdLibRuntime {
             return
         }
         history.ensure(chatId)
+        // Join the retained LRU before the request, not after a successful merge: an empty or
+        // failed warmup must be evictable too, or its state would live outside the cap forever.
+        touchRetention(chatId)
         val request = history.begin(chatId, HistorySlot.WARMUP) ?: run {
             warmupNext(candidates, index + 1)
             return

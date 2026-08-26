@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -423,6 +424,174 @@ class HistoryCoordinatorTest {
 
         assertFalse(coordinator.markLoadableIfUnknown(CHAT))
         assertEquals(HistoryBoundary.END_REACHED, coordinator.peek(CHAT)!!.boundary)
+    }
+
+    // ---- G. retention trim reopens older history ----------------------------
+
+    @Test
+    fun retentionTrimMakesOlderHistoryLoadableAgain() {
+        val coordinator = readyChat()
+        coordinator.completeOlder(coordinator.begin(CHAT, HistorySlot.OLDER)!!, olderThanAnchor = 0)
+        assertEquals("endReached", coordinator.olderRequestBlocked(CHAT))
+
+        // Trimming discarded retained messages, so that history is reachable again.
+        assertTrue(coordinator.onRetentionTrimmed(CHAT))
+
+        assertEquals(HistoryBoundary.CAN_LOAD, coordinator.peek(CHAT)!!.boundary)
+        assertNull(coordinator.olderRequestBlocked(CHAT))
+        assertNotNull(coordinator.begin(CHAT, HistorySlot.OLDER))
+        // An unknown chat has nothing to reopen.
+        assertFalse(HistoryCoordinator().onRetentionTrimmed(CHAT))
+    }
+
+    @Test
+    fun trimWhileOlderRequestIsInFlightMakesThatCallbackStale() {
+        val coordinator = readyChat()
+        val inFlight = coordinator.begin(CHAT, HistorySlot.OLDER)!!
+
+        assertTrue(coordinator.onRetentionTrimmed(CHAT))
+
+        // The response was anchored before the trim: it may not restore the old boundary.
+        assertNull(coordinator.owner(inFlight))
+        assertNull(coordinator.completeOlder(inFlight, olderThanAnchor = 0))
+        assertFalse(coordinator.finish(inFlight))
+
+        val state = coordinator.peek(CHAT)!!
+        assertEquals(HistoryBoundary.CAN_LOAD, state.boundary)
+        assertFalse(state.isLoading(HistorySlot.OLDER))
+        assertNull(coordinator.olderRequestBlocked(CHAT))
+        assertNotNull(coordinator.begin(CHAT, HistorySlot.OLDER))
+    }
+
+    @Test
+    fun retentionTrimOnlyInvalidatesTheOlderSlot() {
+        val coordinator = readyChat()
+        val initial = coordinator.begin(CHAT, HistorySlot.INITIAL)!!
+        val refresh = coordinator.begin(CHAT, HistorySlot.REFRESH)!!
+
+        coordinator.onRetentionTrimmed(CHAT)
+
+        assertNotNull(coordinator.owner(initial))
+        assertNotNull(coordinator.owner(refresh))
+        assertTrue(coordinator.peek(CHAT)!!.initialReady)
+    }
+
+    // ---- H. opening supersedes warmup ---------------------------------------
+
+    @Test
+    fun openingAChatInvalidatesItsInFlightWarmup() {
+        val coordinator = HistoryCoordinator()
+        coordinator.ensure(CHAT)
+        val warmup = coordinator.begin(CHAT, HistorySlot.WARMUP)!!
+
+        coordinator.open(CHAT)
+
+        assertNull(coordinator.owner(warmup))
+        assertFalse(coordinator.finish(warmup))
+        val state = coordinator.peek(CHAT)!!
+        assertTrue(state.active)
+        // The flag is released rather than stranded, so a later warmup may still run.
+        assertFalse(state.isLoading(HistorySlot.WARMUP))
+        assertNotNull(coordinator.begin(CHAT, HistorySlot.WARMUP))
+    }
+
+    @Test
+    fun openingAChatLeavesTheOtherSlotsAndTheViewportIntact() {
+        val coordinator = readyChat()
+        val initial = coordinator.begin(CHAT, HistorySlot.INITIAL)!!
+        val refresh = coordinator.begin(CHAT, HistorySlot.REFRESH)!!
+        val older = coordinator.begin(CHAT, HistorySlot.OLDER)!!
+
+        coordinator.open(CHAT)
+
+        assertNotNull(coordinator.owner(initial))
+        assertNotNull(coordinator.owner(refresh))
+        assertNotNull(coordinator.owner(older))
+        // Reopening does not recreate the record, so the viewport stays ready.
+        assertTrue(coordinator.peek(CHAT)!!.initialReady)
+    }
+
+    // ---- I. warmup states stay bounded --------------------------------------
+
+    @Test
+    fun emptyWarmupsStayInsideTheRetentionCap() {
+        val coordinator = HistoryCoordinator()
+        val total = HistoryPolicy.MAX_RETAINED_CHATS + 5L
+
+        for (chatId in 1L..total) {
+            // The runtime enrolls a warmup candidate in the LRU before sending its request.
+            coordinator.ensure(chatId)
+            coordinator.touch(chatId)
+            val warmup = coordinator.begin(chatId, HistorySlot.WARMUP)!!
+            // GetChatHistory answered empty: cooldown only, nothing merged, nothing retained.
+            coordinator.holdWarmup(chatId, untilMs = HistoryPolicy.WARMUP_COOLDOWN_MS)
+            coordinator.finish(warmup)
+            assertTrue(coordinator.retainedChats() <= HistoryPolicy.MAX_RETAINED_CHATS)
+        }
+
+        var records = 0
+        for (chatId in 1L..total) if (coordinator.peek(chatId) != null) records++
+        assertEquals(HistoryPolicy.MAX_RETAINED_CHATS, records)
+        assertEquals(HistoryPolicy.MAX_RETAINED_CHATS, coordinator.retainedChats())
+        assertNull(coordinator.peek(1L))
+        assertNotNull(coordinator.peek(total))
+        // Cooldown survives on the records that are still held, and still expires.
+        assertFalse(coordinator.warmupAllowed(total, nowMs = 0L))
+        assertTrue(coordinator.warmupAllowed(total, nowMs = HistoryPolicy.WARMUP_COOLDOWN_MS))
+    }
+
+    // ---- J. mutations of not-yet-published messages -------------------------
+
+    @Test
+    fun contentUpdateReachesAMessageStillWaitingForTheFirstPage() {
+        val coordinator = HistoryCoordinator()
+        coordinator.open(CHAT)
+        val original = TdApi.MessageText()
+        val edited = TdApi.MessageText()
+        coordinator.buffer(CHAT, message(100L).also { it.content = original })
+
+        assertTrue(coordinator.updatePendingContent(CHAT, 100L, edited))
+        assertFalse(coordinator.updatePendingContent(CHAT, 999L, TdApi.MessageText()))
+        assertFalse(coordinator.updatePendingContent(2L, 100L, TdApi.MessageText()))
+
+        val drained = coordinator.drainPending(CHAT).single()
+        assertSame(edited, drained.content)
+    }
+
+    @Test
+    fun deletedBufferedMessageNeverReappearsAfterDrain() {
+        val coordinator = HistoryCoordinator()
+        coordinator.open(CHAT)
+        coordinator.buffer(CHAT, message(100L))
+        coordinator.buffer(CHAT, message(101L))
+
+        assertTrue(coordinator.removePending(CHAT, setOf(100L)))
+        assertFalse(coordinator.removePending(CHAT, setOf(500L)))
+        assertFalse(coordinator.removePending(2L, setOf(100L)))
+        assertEquals(1, coordinator.pendingCount(CHAT))
+        assertEquals(listOf(101L), coordinator.drainPending(CHAT).map { it.id })
+
+        // Deleting the only buffered message leaves nothing to drain at all.
+        coordinator.buffer(CHAT, message(102L))
+        assertTrue(coordinator.removePending(CHAT, setOf(102L)))
+        assertEquals(0, coordinator.pendingCount(CHAT))
+        assertTrue(coordinator.drainPending(CHAT).isEmpty())
+    }
+
+    @Test
+    fun retainedCopyIsNotOverwrittenByAStaleBufferedDuplicate() {
+        val coordinator = HistoryCoordinator()
+        coordinator.open(CHAT)
+        val request = coordinator.begin(CHAT, HistorySlot.INITIAL)!!
+        coordinator.buffer(CHAT, message(100L))
+        coordinator.buffer(CHAT, message(101L))
+
+        assertTrue(coordinator.markInitialReady(request))
+        // The page being published already holds 100, so only 101 may come from the buffer.
+        val drained = coordinator.drainPending(CHAT, retainedIds = setOf(100L))
+
+        assertEquals(listOf(101L), drained.map { it.id })
+        assertEquals(0, coordinator.pendingCount(CHAT))
     }
 
     private fun readyChat(): HistoryCoordinator = HistoryCoordinator().also {

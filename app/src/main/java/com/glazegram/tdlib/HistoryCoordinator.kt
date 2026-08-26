@@ -96,8 +96,17 @@ class HistoryCoordinator(
 
     fun retainedChats(): Int = retention.size
 
-    /** Marks the chat open, creating its coordination record when absent. */
-    fun open(chatId: Long): HistoryState = ensure(chatId).also { it.markActive(true) }
+    /**
+     * Marks the chat open, creating its coordination record when absent. Opening supersedes an
+     * in-flight warmup for the same chat: warmup fills history for chats without a viewport, so
+     * its response must not land on a chat that now has one. Only the warmup slot is invalidated
+     * — releasing it also keeps the loading flag from being stranded, and the warmup chain
+     * continues because its callback still runs, just without ownership.
+     */
+    fun open(chatId: Long): HistoryState = ensure(chatId).also {
+        it.markActive(true)
+        it.release(HistorySlot.WARMUP)
+    }
 
     /** Creates the coordination record without marking the chat open (warmup). */
     fun ensure(chatId: Long): HistoryState = states.getOrPut(chatId) { HistoryState(++sequence) }
@@ -201,6 +210,20 @@ class HistoryCoordinator(
         return true
     }
 
+    /**
+     * A retention trim threw away retained messages, so history that was already paged in is
+     * reachable again — even from [HistoryBoundary.END_REACHED], which is why this is a separate
+     * transition from [markLoadableIfUnknown]. An older request that is still in flight was
+     * anchored before the trim, so its slot is released: it can neither restore END_REACHED nor
+     * strand the loading flag, and a fresh request may start against the new anchor.
+     */
+    fun onRetentionTrimmed(chatId: Long): Boolean {
+        val state = states[chatId] ?: return false
+        state.moveBoundary(HistoryBoundary.CAN_LOAD)
+        state.release(HistorySlot.OLDER)
+        return true
+    }
+
     // ---- warmup ------------------------------------------------------------
 
     fun warmupAllowed(chatId: Long, nowMs: Long): Boolean {
@@ -246,7 +269,42 @@ class HistoryCoordinator(
 
     fun pendingCount(chatId: Long): Int = pendingRealtime[chatId]?.size ?: 0
 
-    fun drainPending(chatId: Long): List<TdApi.Message> = pendingRealtime.remove(chatId).orEmpty()
+    /** Applies an edit to a message that is still waiting for the first page. */
+    fun updatePendingContent(chatId: Long, messageId: Long, content: TdApi.MessageContent): Boolean {
+        val buffered = pendingRealtime[chatId] ?: return false
+        var updated = false
+        for (message in buffered) {
+            if (message.id == messageId) {
+                message.content = content
+                updated = true
+            }
+        }
+        return updated
+    }
+
+    /** Drops deleted messages from the buffer so a drain can never resurrect them. */
+    fun removePending(chatId: Long, messageIds: Set<Long>): Boolean {
+        val buffered = pendingRealtime[chatId] ?: return false
+        val remaining = buffered.filterNot { it.id in messageIds }
+        if (remaining.size == buffered.size) return false
+        if (remaining.isEmpty()) {
+            pendingRealtime.remove(chatId)
+        } else {
+            buffered.clear()
+            buffered.addAll(remaining)
+        }
+        return true
+    }
+
+    /**
+     * Hands over the buffered messages and forgets them. Ids in [retainedIds] are dropped: the
+     * page that is being published already holds a newer copy, which a buffered one must not
+     * overwrite.
+     */
+    fun drainPending(chatId: Long, retainedIds: Set<Long> = emptySet()): List<TdApi.Message> {
+        val buffered = pendingRealtime.remove(chatId) ?: return emptyList()
+        return if (retainedIds.isEmpty()) buffered else buffered.filterNot { it.id in retainedIds }
+    }
 
     // ---- retention ---------------------------------------------------------
 
