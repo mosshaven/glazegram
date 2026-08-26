@@ -162,6 +162,7 @@ import com.glazegram.tdlib.AuthUiState
 import com.glazegram.tdlib.ChatMessage
 import com.glazegram.tdlib.ChatKind
 import com.glazegram.tdlib.ChatSummary
+import com.glazegram.tdlib.ConnectionUiState
 import com.glazegram.tdlib.DeliveryState
 import com.glazegram.tdlib.MediaKind
 import com.glazegram.tdlib.MessageTextStyleKind
@@ -180,6 +181,9 @@ import com.glazegram.ui.components.rememberDecodedImage
 import com.glazegram.ui.components.rememberPressInteraction
 import com.glazegram.ui.theme.Motion
 import com.glazegram.ui.theme.Spacing
+import com.glazegram.ui.ChatListViewportSnapshot
+import com.glazegram.ui.isSettledAtTop
+import com.glazegram.ui.shouldRestoreChatListTop
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -384,12 +388,38 @@ private fun ChatListScreen(
     onChat: (Long) -> Unit,
 ) {
     val chatListLoaded by TdLibRuntime.chatListLoaded.collectAsState()
+    val connectionUiState by TdLibRuntime.connectionUiState.collectAsState()
     var searchMode by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val focus = remember { FocusRequester() }
+    var wasAtTopBeforeMutation by remember { mutableStateOf(true) }
     val visibleChats = remember(chats, searchQuery) {
         if (searchQuery.isBlank()) chats
         else chats.filter { it.title.contains(searchQuery, ignoreCase = true) }
+    }
+
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            Triple(
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset,
+                listState.isScrollInProgress,
+            )
+        }.collect { (index, offset, scrolling) ->
+            // Keep last settled position. During a drag/fling, don't classify an
+            // in-flight position as the user's final anchor.
+            if (!scrolling) {
+                wasAtTopBeforeMutation = ChatListViewportSnapshot(index, offset, scrolling).isSettledAtTop()
+            }
+        }
+    }
+
+    LaunchedEffect(chats) {
+        // Stable keys preserve the anchor for users reading older chats. Only
+        // explicitly restore item 0 when the list was already settled there.
+        if (shouldRestoreChatListTop(wasAtTopBeforeMutation, listState.isScrollInProgress, searchMode)) {
+            listState.scrollToItem(0)
+        }
     }
 
     BackHandler(enabled = searchMode) {
@@ -402,7 +432,12 @@ private fun ChatListScreen(
                 TopAppBar(
                     title = {
                         Text(
-                            "Glazegram",
+                            when (connectionUiState) {
+                                ConnectionUiState.READY -> "Glazegram"
+                                ConnectionUiState.UPDATING -> "Обновление…"
+                                ConnectionUiState.CONNECTING -> "Подключение…"
+                                ConnectionUiState.WAITING_FOR_NETWORK -> "Ожидание сети…"
+                            },
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.SemiBold,
                         )
@@ -620,11 +655,12 @@ private fun SettingsScreen(account: AccountSummary?, onMenu: () -> Unit) {
                 headlineContent = { Text("Диагностика") },
                 supportingContent = { Text("Уровень логов: ${com.glazegram.diagnostics.GlazeLog.level}") },
                 modifier = Modifier.clip(MaterialTheme.shapes.medium).clickable {
-                    com.glazegram.diagnostics.GlazeLog.level = when (com.glazegram.diagnostics.GlazeLog.level) {
+                    val next = when (com.glazegram.diagnostics.GlazeLog.level) {
                         com.glazegram.diagnostics.LogLevel.OFF -> com.glazegram.diagnostics.LogLevel.BASIC
                         com.glazegram.diagnostics.LogLevel.BASIC -> com.glazegram.diagnostics.LogLevel.VERBOSE
                         com.glazegram.diagnostics.LogLevel.VERBOSE -> com.glazegram.diagnostics.LogLevel.OFF
                     }
+                    com.glazegram.diagnostics.GlazeLog.setLevelAndPersist(context, next)
                 },
             )
             ListItem(
@@ -1026,8 +1062,8 @@ private fun MessageBubble(
             color = bubbleColor,
             shape = when {
                 message.isOutgoing -> RoundedCornerShape(
-                    topStart = if (joinsOlder) 8.dp else 20.dp,
-                    topEnd = 20.dp,
+                    topStart = 20.dp,
+                    topEnd = if (joinsOlder) 8.dp else 20.dp,
                     bottomEnd = if (joinsNewer) 8.dp else 5.dp,
                     bottomStart = 20.dp,
                 )
@@ -1188,11 +1224,15 @@ private fun AlbumBubble(
             },
             shape = when {
                 outgoing -> RoundedCornerShape(
-                    topStart = if (album.joinsOlder) 8.dp else 20.dp,
+                    topStart = 20.dp,
+                    topEnd = if (album.joinsOlder) 8.dp else 20.dp,
                     bottomEnd = if (album.joinsNewer) 8.dp else 5.dp,
+                    bottomStart = 20.dp,
                 )
                 else -> RoundedCornerShape(
                     topStart = if (album.joinsOlder) 8.dp else 20.dp,
+                    topEnd = 20.dp,
+                    bottomEnd = 20.dp,
                     bottomStart = if (album.joinsNewer) 8.dp else 5.dp,
                 )
             },
