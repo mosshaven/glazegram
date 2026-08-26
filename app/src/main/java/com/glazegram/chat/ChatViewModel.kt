@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.glazegram.tdlib.ChatMessage
 import com.glazegram.tdlib.MessageDeleteCapability
 import com.glazegram.tdlib.TdLibRuntime
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -143,14 +144,17 @@ class ChatViewModel(private val chatId: Long) : ViewModel() {
     }
 
     fun highlight(messageId: Long) {
+        highlightJob?.cancel()
         interaction.value = interaction.value.copy(highlightedMessageId = messageId)
-        viewModelScope.launch {
+        highlightJob = viewModelScope.launch {
             delay(2_000)
             if (interaction.value.highlightedMessageId == messageId) {
                 interaction.value = interaction.value.copy(highlightedMessageId = null)
             }
         }
     }
+
+    private var highlightJob: Job? = null
 
     class Factory(private val chatId: Long) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")

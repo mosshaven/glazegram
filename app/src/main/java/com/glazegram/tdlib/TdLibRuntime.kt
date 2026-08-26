@@ -11,6 +11,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Collections
 import com.glazegram.BuildConfig
+import com.glazegram.diagnostics.GlazeLog
+import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,6 +24,8 @@ object TdLibRuntime {
     val state: StateFlow<AuthUiState> = mutableState.asStateFlow()
     private val mutableChats = MutableStateFlow<List<ChatSummary>>(emptyList())
     val chats: StateFlow<List<ChatSummary>> = mutableChats.asStateFlow()
+    private val mutableChatListLoaded = MutableStateFlow(false)
+    val chatListLoaded: StateFlow<Boolean> = mutableChatListLoaded.asStateFlow()
     private val mutableMessages = MutableStateFlow<Map<Long, List<ChatMessage>>>(emptyMap())
     val messages: StateFlow<Map<Long, List<ChatMessage>>> = mutableMessages.asStateFlow()
     private val mutableHistoryLoading = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
@@ -52,6 +56,13 @@ object TdLibRuntime {
     private var suppressChatPublishing = false
     private var currentUser: TdApi.User? = null
     private lateinit var preferences: android.content.SharedPreferences
+
+    // Process-local retention – bounded LRU, metadata only (no bitmap)
+    private val retentionOrder = LinkedHashMap<Long, Unit>(16, 0.75f, true)
+    private val MAX_RETAINED_CHATS = 8 // keep recent 8 chats
+    private val MAX_MESSAGES_PER_CHAT = 150 // cap per chat to bound memory
+    private val INITIAL_PAGE_SIZE = 50
+    private val RETAINED_VIEWPORT_THRESHOLD = 20 // usable viewport if >=20 messages retained
 
     fun initialize(context: Context) {
         if (initialized) return
@@ -148,16 +159,23 @@ object TdLibRuntime {
     fun openChat(chatId: Long) {
         send(TdApi.OpenChat(chatId))
         messageHistory.putIfAbsent(chatId, emptyArray())
-        if (mutableHistoryLoading.value[chatId] == true) return
-
-        val existing = messageHistory[chatId].orEmpty()
-        val lastMessage = synchronized(chatMap) { chatMap[chatId]?.lastMessage }
-        if (existing.isEmpty() && lastMessage != null) {
-            mergeMessages(chatId, arrayOf(lastMessage))
-            loadHistory(chatId, lastMessage.id, localFirst = true)
-        } else {
-            loadHistory(chatId, 0L, localFirst = false)
+        touchRetention(chatId)
+        if (mutableHistoryLoading.value[chatId] == true) {
+            GlazeLog.paginationSuppressed(chatId, "openChat already loading")
+            return
         }
+
+        val existingSize = messageHistory[chatId]?.size ?: 0
+        val cacheHit = existingSize >= RETAINED_VIEWPORT_THRESHOLD
+        GlazeLog.historyOpen(chatId, cacheHit, retentionOrder.size)
+        if (cacheHit) {
+            // Retained viewport already available via StateFlow – no need to block UI.
+            // Ensure hasMore is known; if unknown, keep true.
+            // Optionally refresh in background via network? Keep lightweight – do not auto-load.
+            return
+        }
+        // Cold open: bounded local-first initial page (no single-message floating)
+        loadInitial(chatId)
     }
 
     fun refreshChats() {
@@ -171,7 +189,8 @@ object TdLibRuntime {
 
     fun refreshChatHistory(chatId: Long) {
         if (mutableState.value == AuthUiState.Ready && mutableHistoryLoading.value[chatId] != true) {
-            loadHistory(chatId, 0L, localFirst = false)
+            // bounded refresh – local first then network
+            loadInitial(chatId)
         }
     }
 
@@ -180,10 +199,38 @@ object TdLibRuntime {
     }
 
     fun loadOlderMessages(chatId: Long) {
-        if (mutableHistoryLoading.value[chatId] == true) return
-        if (mutableHistoryHasMore.value[chatId] == false) return
+        if (mutableHistoryLoading.value[chatId] == true) {
+            GlazeLog.paginationSuppressed(chatId, "older already loading")
+            return
+        }
+        if (mutableHistoryHasMore.value[chatId] == false) {
+            GlazeLog.paginationSuppressed(chatId, "endReached")
+            return
+        }
         val oldestMessageId = messageHistory[chatId]?.lastOrNull()?.id ?: return
-        loadHistory(chatId, oldestMessageId, localFirst = true)
+        // Older pagination always bounded single request, network (not local loop)
+        touchRetention(chatId)
+        mutableHistoryLoading.value = mutableHistoryLoading.value + (chatId to true)
+        val t0 = SystemClock.elapsedRealtime()
+        send(
+            TdApi.GetChatHistory(chatId, oldestMessageId, 0, INITIAL_PAGE_SIZE, false),
+            result = { result ->
+                val history = result as? TdApi.Messages ?: return@send
+                val count = history.messages.size
+                if (count > 0) mergeMessages(chatId, history.messages)
+                val hasMore = count == INITIAL_PAGE_SIZE && history.messages.lastOrNull()?.id != oldestMessageId && count > 0
+                // If TDLib returns <50, we are at beginning
+                val endReached = !hasMore
+                finishHistoryLoad(chatId, hasMore)
+                val latency = SystemClock.elapsedRealtime() - t0
+                GlazeLog.historyOlder(chatId, oldestMessageId, count, endReached, latency)
+            },
+            onFailure = { error ->
+                Log.e("TdLibHistory", "older chat=$chatId failed: $error")
+                GlazeLog.paginationSuppressed(chatId, "older request failed: $error")
+                finishHistoryLoad(chatId, hasMore = mutableHistoryHasMore.value[chatId] != false)
+            },
+        )
     }
 
     fun sendTextMessage(chatId: Long, text: String, replyToMessageId: Long? = null): Boolean {
@@ -247,41 +294,66 @@ object TdLibRuntime {
         messageMediaFile(message.content)?.let { requestFile(it, priority = 32) }
     }
 
-    private fun loadHistory(chatId: Long, fromMessageId: Long, localFirst: Boolean) {
+    private fun loadInitial(chatId: Long) {
         mutableHistoryLoading.value = mutableHistoryLoading.value + (chatId to true)
-        requestHistoryPage(chatId, fromMessageId, onlyLocal = localFirst)
-    }
-
-    private fun requestHistoryPage(
-        chatId: Long,
-        fromMessageId: Long,
-        onlyLocal: Boolean,
-    ) {
+        // 1. local page first – bounded, no recursive walk
+        val tLocal = SystemClock.elapsedRealtime()
         send(
-            TdApi.GetChatHistory(chatId, fromMessageId, 0, 50, onlyLocal),
-            result = { result ->
-                val history = result as? TdApi.Messages ?: return@send
-                if (history.messages.isNotEmpty()) mergeMessages(chatId, history.messages)
-                val nextCursor = history.messages.lastOrNull()?.id ?: fromMessageId
-                Log.d(
-                    "TdLibHistory",
-                    "chat=$chatId cursor=$fromMessageId local=$onlyLocal received=${history.messages.size} next=$nextCursor",
+            TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, true),
+            result = { localResult ->
+                val local = localResult as? TdApi.Messages
+                val localCount = local?.messages?.size ?: 0
+                val localLatency = SystemClock.elapsedRealtime() - tLocal
+                GlazeLog.historyLocal(chatId, localCount, localLatency)
+                if (localCount > 0 && local != null) {
+                    mergeMessages(chatId, local.messages)
+                    // hasMore for local: if 50 then likely more, but we still need network
+                    val localHasMore = localCount == INITIAL_PAGE_SIZE
+                    mutableHistoryHasMore.value = mutableHistoryHasMore.value + (chatId to localHasMore)
+                    // Render local viewport immediately via publishMessages (merge does it)
+                    // Fall through to network refresh
+                }
+                // 2. network page to refresh/fill
+                val tNet = SystemClock.elapsedRealtime()
+                send(
+                    TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, false),
+                    result = { netResult ->
+                        val net = netResult as? TdApi.Messages
+                        val netCount = net?.messages?.size ?: 0
+                        if (netCount > 0 && net != null) mergeMessages(chatId, net.messages)
+                        val hasMore = netCount == INITIAL_PAGE_SIZE
+                        val latency = SystemClock.elapsedRealtime() - tNet
+                        finishHistoryLoad(chatId, hasMore)
+                        GlazeLog.historyNetwork(chatId, netCount, latency, !hasMore)
+                    },
+                    onFailure = { err ->
+                        Log.e("TdLibHistory", "initial network chat=$chatId failed: $err")
+                        // keep local hasMore if we had local, else mark end
+                        if (localCount == 0) finishHistoryLoad(chatId, false)
+                        else finishHistoryLoad(chatId, localCount == INITIAL_PAGE_SIZE)
+                    },
                 )
-
-                if (onlyLocal && history.messages.size < 50) {
-                    requestHistoryPage(chatId, nextCursor, onlyLocal = false)
-                    return@send
-                }
-                val hasMore = onlyLocal || (history.messages.isNotEmpty() && nextCursor != fromMessageId)
-                finishHistoryLoad(chatId, hasMore)
             },
-            onFailure = { error ->
-                Log.e("TdLibHistory", "chat=$chatId cursor=$fromMessageId local=$onlyLocal failed: $error")
-                if (onlyLocal) {
-                    requestHistoryPage(chatId, fromMessageId, onlyLocal = false)
-                    return@send
-                }
-                finishHistoryLoad(chatId, hasMore = mutableHistoryHasMore.value[chatId] != false)
+            onFailure = { err ->
+                Log.e("TdLibHistory", "initial local chat=$chatId failed: $err")
+                // fallback directly to network
+                val tNet = SystemClock.elapsedRealtime()
+                send(
+                    TdApi.GetChatHistory(chatId, 0, 0, INITIAL_PAGE_SIZE, false),
+                    result = { netResult ->
+                        val net = netResult as? TdApi.Messages
+                        val netCount = net?.messages?.size ?: 0
+                        if (netCount > 0 && net != null) mergeMessages(chatId, net.messages)
+                        val hasMore = netCount == INITIAL_PAGE_SIZE
+                        val latency = SystemClock.elapsedRealtime() - tNet
+                        finishHistoryLoad(chatId, hasMore)
+                        GlazeLog.historyNetwork(chatId, netCount, latency, !hasMore)
+                    },
+                    onFailure = { e2 ->
+                        Log.e("TdLibHistory", "initial network fallback chat=$chatId failed: $e2")
+                        finishHistoryLoad(chatId, false)
+                    },
+                )
             },
         )
     }
@@ -289,6 +361,32 @@ object TdLibRuntime {
     private fun finishHistoryLoad(chatId: Long, hasMore: Boolean) {
         mutableHistoryLoading.value = mutableHistoryLoading.value + (chatId to false)
         mutableHistoryHasMore.value = mutableHistoryHasMore.value + (chatId to hasMore)
+    }
+
+    private fun touchRetention(chatId: Long) {
+        retentionOrder[chatId] = Unit
+        // trim per-chat message count
+        trimHistory(chatId)
+        // evict oldest chats if over limit
+        while (retentionOrder.size > MAX_RETAINED_CHATS) {
+            val eldest = retentionOrder.keys.firstOrNull() ?: break
+            retentionOrder.remove(eldest)
+            messageHistory.remove(eldest)
+            mutableMessages.value = mutableMessages.value - eldest
+            mutableHistoryLoading.value = mutableHistoryLoading.value - eldest
+            mutableHistoryHasMore.value = mutableHistoryHasMore.value - eldest
+            GlazeLog.retentionEvict(eldest, retentionOrder.size)
+        }
+    }
+
+    private fun trimHistory(chatId: Long) {
+        val arr = messageHistory[chatId] ?: return
+        if (arr.size > MAX_MESSAGES_PER_CHAT) {
+            // keep most recent MAX messages (newest first)
+            val trimmed = arr.take(MAX_MESSAGES_PER_CHAT).toTypedArray()
+            messageHistory[chatId] = trimmed
+            publishMessages(chatId)
+        }
     }
 
     private lateinit var storageContext: Context
@@ -403,10 +501,12 @@ object TdLibRuntime {
             TdApi.LoadChats(TdApi.ChatListMain(), 100),
             result = {
                 suppressChatPublishing = false
+                mutableChatListLoaded.value = true
                 publishChats()
             },
             onFailure = {
                 suppressChatPublishing = false
+                mutableChatListLoaded.value = true
                 publishChats()
             },
         )
@@ -501,10 +601,12 @@ object TdLibRuntime {
             chatActions.clear()
             messageHistory.clear()
         }
+        retentionOrder.clear()
         pendingUserRequests.clear()
         finalizedTemporaryMessageIds.clear()
         currentUser = null
         mutableChats.value = emptyList()
+        mutableChatListLoaded.value = false
         mutableMessages.value = emptyMap()
         mutableHistoryLoading.value = emptyMap()
         mutableHistoryHasMore.value = emptyMap()
@@ -617,6 +719,9 @@ object TdLibRuntime {
                     chatMap[update.chatId]?.lastReadOutboxMessageId = update.lastReadOutboxMessageId
                     if (messageHistory.containsKey(update.chatId)) publishMessages(update.chatId)
                 }
+                is TdApi.UpdateChatNotificationSettings -> {
+                    chatMap[update.chatId]?.notificationSettings = update.notificationSettings
+                }
                 is TdApi.UpdateFile -> updateAvatar(update.file)
                 else -> return false
             }
@@ -630,36 +735,93 @@ object TdLibRuntime {
         return true
     }
 
+    // Background warmup – bounded, local only, low concurrency
+    @Volatile private var warmupInFlight = false
+    private fun maybeWarmupRecentChats() {
+        if (warmupInFlight) return
+        if (mutableState.value != AuthUiState.Ready) return
+        val top = mutableChats.value.take(3)
+        val candidates = top.filter { (messageHistory[it.id]?.size ?: 0) < 10 }
+        if (candidates.isEmpty()) return
+        warmupInFlight = true
+        GlazeLog.warmup("start", "candidates=${candidates.map { it.id }}")
+        // warm sequentially, local only, no media download (requestMessageMedia not called for warmup? we will call but it only requests file for thumbnails, which is cheap)
+        fun warmNext(index: Int) {
+            if (index >= candidates.size || index >= 2) { // max 2 at a time
+                warmupInFlight = false
+                GlazeLog.warmup("end", "warmed $index chats retained=${retentionOrder.size}")
+                return
+            }
+            val chatId = candidates[index].id
+            if (messageHistory[chatId]?.isNotEmpty() == true) {
+                warmNext(index + 1)
+                return
+            }
+            send(
+                TdApi.GetChatHistory(chatId, 0, 0, 20, true),
+                result = { res ->
+                    val msgs = (res as? TdApi.Messages)?.messages
+                    if (!msgs.isNullOrEmpty()) {
+                        // merge without triggering full publish churn for warmup? still merge
+                        mergeMessages(chatId, msgs)
+                        mutableHistoryHasMore.value = mutableHistoryHasMore.value + (chatId to (msgs.size == 20))
+                    }
+                    warmNext(index + 1)
+                },
+                onFailure = { warmNext(index + 1) },
+            )
+        }
+        warmNext(0)
+    }
+
     private fun publishChats() {
         mutableChats.value = synchronized(chatMap) {
             chatMap.values
                 .map { chat ->
                     val position = chat.positions.firstOrNull { it.list is TdApi.ChatListMain }
+                    val kind = when (val type = chat.type) {
+                        is TdApi.ChatTypePrivate -> ChatKind.Private
+                        is TdApi.ChatTypeBasicGroup -> ChatKind.BasicGroup
+                        is TdApi.ChatTypeSupergroup -> if (type.isChannel) ChatKind.Channel else ChatKind.Supergroup
+                        is TdApi.ChatTypeSecret -> ChatKind.Secret
+                        else -> ChatKind.Private
+                    }
+                    val last = chat.lastMessage
+                    val isOutgoing = last?.isOutgoing == true
+                    val isSaved = (chat.type as? TdApi.ChatTypePrivate)?.userId?.let { it == currentUser?.id } == true ||
+                        (chat.type as? TdApi.ChatTypeSecret)?.userId?.let { it == currentUser?.id } == true
+                    val isMuted = (chat.notificationSettings?.muteFor ?: 0) != 0
                     ChatSummary(
                         id = chat.id,
                         title = chat.title,
-                        lastMessageAuthor = messageAuthorOrEmpty(chat.lastMessage),
-                        lastMessage = messagePreview(chat.lastMessage),
-                        lastMessageTime = chat.lastMessage?.let(::formatMessageTime).orEmpty(),
+                        lastMessageAuthor = messageAuthorOrEmpty(last),
+                        lastMessage = chatListPreview(
+                            messageAuthorOrEmpty(last),
+                            messagePreview(last),
+                            kind,
+                            isOutgoing,
+                            isSaved,
+                        ),
+                        lastMessageTime = last?.let(::formatMessageTime).orEmpty(),
                         unreadCount = chat.unreadCount,
                         isPinned = position?.isPinned == true,
                         order = position?.order ?: 0L,
                         avatarPath = chat.photo?.small?.local?.path?.takeIf { chat.photo?.small?.local?.isDownloadingCompleted == true },
-                        kind = when (val type = chat.type) {
-                            is TdApi.ChatTypePrivate -> ChatKind.Private
-                            is TdApi.ChatTypeBasicGroup -> ChatKind.BasicGroup
-                            is TdApi.ChatTypeSupergroup -> if (type.isChannel) ChatKind.Channel else ChatKind.Supergroup
-                            is TdApi.ChatTypeSecret -> ChatKind.Secret
-                            else -> ChatKind.Private
-                        },
+                        kind = kind,
                         subtitle = chatSubtitle(chat),
                         canSendMessages = chat.permissions.canSendBasicMessages,
                         unreadMentionCount = chat.unreadMentionCount,
+                        lastMessageIsOutgoing = isOutgoing,
+                        lastMessageDeliveryState = last?.let { deliveryState(it) }?.takeIf { isOutgoing },
+                        isMuted = isMuted,
+                        isSavedMessages = isSaved,
                     )
                 }
                 .filter { it.order != 0L }
                 .sortedWith(compareByDescending<ChatSummary> { it.order }.thenByDescending { it.id })
         }
+        // trigger small bounded warmup for top chats (local only)
+        maybeWarmupRecentChats()
     }
 
     private fun publishMessages(chatId: Long) {
@@ -695,6 +857,9 @@ object TdLibRuntime {
                 forwardedFrom = forwardOriginName(message.forwardInfo?.origin),
                 containsUnreadMention = message.containsUnreadMention,
                 contentPreview = dialogPreview(message.content),
+                date = message.date,
+                senderKey = senderKey(message.senderId),
+                isService = media.kind == MediaKind.Service || media.kind == MediaKind.Unsupported,
             )
     }
 
@@ -894,7 +1059,25 @@ object TdLibRuntime {
         val existing = messageHistory[chatId].orEmpty()
         val merged = LinkedHashMap<Long, TdApi.Message>()
         (existing.asList() + messages.asList()).forEach { merged[it.id] = it }
-        messageHistory[chatId] = merged.values.sortedWith(messageComparator).toTypedArray()
+        var sorted = merged.values.sortedWith(messageComparator).toTypedArray()
+        // deduplicate already done via map, enforce bounded per-chat retention (no bitmap)
+        if (sorted.size > MAX_MESSAGES_PER_CHAT) {
+            sorted = sorted.take(MAX_MESSAGES_PER_CHAT).toTypedArray()
+            GlazeLog.d("History/Retention", "trim chatId=$chatId size=${sorted.size} capped=$MAX_MESSAGES_PER_CHAT")
+        }
+        messageHistory[chatId] = sorted
+        retentionOrder[chatId] = Unit
+        // evict oldest chats if needed
+        while (retentionOrder.size > MAX_RETAINED_CHATS) {
+            val eldest = retentionOrder.keys.firstOrNull() ?: break
+            if (eldest == chatId) break // don't evict current
+            retentionOrder.remove(eldest)
+            messageHistory.remove(eldest)
+            mutableMessages.value = mutableMessages.value - eldest
+            mutableHistoryLoading.value = mutableHistoryLoading.value - eldest
+            mutableHistoryHasMore.value = mutableHistoryHasMore.value - eldest
+            GlazeLog.retentionEvict(eldest, retentionOrder.size)
+        }
         messages.forEach(::requestMessageAuthor)
         messages.forEach(::requestForwardOrigin)
         messages.forEach(::requestMessageMedia)
@@ -1048,7 +1231,7 @@ object TdLibRuntime {
         is TdApi.MessageVideo -> MediaContent(
             MediaKind.Video,
             content.caption.text,
-            previewPath = completedPath(content.video.video) ?: completedPath(content.video.thumbnail?.file),
+            previewPath = completedPath(content.video.thumbnail?.file),
             openPath = completedPath(content.video.video),
             fileId = content.video.video.id,
             mimeType = content.video.mimeType,

@@ -36,7 +36,7 @@
 - [x] Member/online counts and permission-aware composer
 
 ## Phase 3.1 — Functional UI foundation
-- [x] Material 3 and Monet colors
+- [x] Material 3 with dynamic Monet colors
 - [x] Stable chat-list scroll position
 - [x] Navigation drawer with account header
 - [x] Settings and confirmed logout
@@ -50,7 +50,7 @@
 - [x] Around-message loading, exact-ID navigation and highlight
 - [x] Extensible message action state with Reply and Copy
 - [x] Presentation-only media album grouping with stable identities
-- [x] Realtime album regrouping from message/file updates
+- [x] Realtime album regrouping from message updates
 - [x] Aspect-ratio media layout with minithumbnail placeholders
 - [x] Chat ViewModel/state-holder boundary
 - [x] Swipe-to-reply and jump-to-bottom unread control
@@ -58,7 +58,23 @@
 - [x] Property-based single-message deletion
 - [ ] Complete album boundaries split across history pages
 - [ ] Cross-chat reply navigation and quote selection
-- [ ] Production mosaic geometry and async image decoding
+- [ ] Production mosaic geometry
+
+## Phase 3.3 — Material design system (current work)
+
+Design tokens and reusable components developed alongside functionality.
+Runtime visual QA pending unless noted.
+
+- [x] Typography scale with swappable font-family architecture
+- [x] Shape scale and spacing tokens
+- [x] Motion tokens (durations/easing) for shared animation timing
+- [x] Async image decoding boundary with bounded memory cache
+- [x] Reusable avatar component (async image + initials fallback)
+- [x] Press-feedback modifier for tactile interactions
+- [x] Empty/loading state primitives
+- [ ] Apply design system to settings screen
+- [ ] Apply design system to auth screens
+- [ ] Context-action sheet polish
 
 ## Phase 4 — Basic messaging
 - [ ] Media message models and preview loading (partial; core photo/video metadata supported)
@@ -88,12 +104,14 @@
 - Performance
 - Background operation
 
-## Phase 7 — Custom client features
-- Themes
-- iOS-like UI
-- Material UI
-- Liquid Glass
-- Customization
+## Phase 7 — Alternative appearance systems
+
+Future work after the Material implementation is stable. These are separate
+appearance modes and must not contaminate or fragment the current Material UI.
+
+- Apple-inspired appearance mode
+- Liquid Glass-inspired appearance mode
+- Extensive customization
 - Monet Light/Dark/AMOLED presets
 - Configurable bubble shapes
 - Open-source and system font selection
@@ -104,8 +122,6 @@
 - Advanced forward/send options
 - Drawer appearance customization
 - Media quality and transfer controls
-- Press-scale and context-menu animations
 - Local aliases
 - Notes
 - Snooze
-- etc.

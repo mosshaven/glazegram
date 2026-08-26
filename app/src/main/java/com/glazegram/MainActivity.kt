@@ -1,6 +1,6 @@
 package com.glazegram
 
-import android.graphics.BitmapFactory
+import android.view.HapticFeedbackConstants
 import android.content.Intent
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -13,9 +13,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.core.content.ContextCompat
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.animateColorAsState
@@ -36,9 +40,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -52,12 +60,31 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.NotificationsOff
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -69,15 +96,19 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
@@ -96,9 +127,10 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -113,8 +145,11 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -137,6 +172,14 @@ import com.glazegram.chat.MessageListItem
 import com.glazegram.chat.containsMessage
 import com.glazegram.chat.resolveReplyTarget
 import com.glazegram.ui.theme.GlazegramTheme
+import com.glazegram.ui.components.EmptyState
+import com.glazegram.ui.components.GlazegramAvatar
+import com.glazegram.ui.components.LoadingState
+import com.glazegram.ui.components.pressScale
+import com.glazegram.ui.components.rememberDecodedImage
+import com.glazegram.ui.components.rememberPressInteraction
+import com.glazegram.ui.theme.Motion
+import com.glazegram.ui.theme.Spacing
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -176,7 +219,14 @@ private fun AppRoot() {
     }
     AnimatedContent(
         targetState = state,
-        transitionSpec = { fadeIn() togetherWith fadeOut() },
+        transitionSpec = {
+            (slideInHorizontally(tween(Motion.DURATION_MEDIUM, easing = Motion.EasingStandard)) { it / 6 } + fadeIn(
+                tween(Motion.DURATION_MEDIUM)
+            )) togetherWith
+                (slideOutHorizontally(tween(Motion.DURATION_MEDIUM, easing = Motion.EasingExit)) { -it / 6 } + fadeOut(
+                    tween(Motion.DURATION_SHORT)
+                ))
+        },
         label = "app-state",
     ) { current ->
         when (current) {
@@ -248,7 +298,14 @@ private fun AuthenticatedApp() {
     ) {
         AnimatedContent(
             targetState = selectedChatId,
-            transitionSpec = { fadeIn() togetherWith fadeOut() },
+            transitionSpec = {
+                (slideInHorizontally(tween(Motion.DURATION_MEDIUM, easing = Motion.EasingStandard)) { it / 4 } + fadeIn(
+                    tween(Motion.DURATION_MEDIUM)
+                )) togetherWith
+                    (slideOutHorizontally(tween(Motion.DURATION_MEDIUM, easing = Motion.EasingStandard)) { -it / 4 } + fadeOut(
+                        tween(Motion.DURATION_SHORT)
+                    ))
+            },
             label = "chat-navigation",
         ) { chatId ->
             val chat = chats.firstOrNull { it.id == chatId }
@@ -275,32 +332,49 @@ private fun AppDrawer(
     destination: MainDestination,
     onDestination: (MainDestination) -> Unit,
 ) {
-    ModalDrawerSheet {
-        Column(Modifier.fillMaxWidth().padding(24.dp)) {
-            ChatAvatar(account?.name ?: "Glazegram", account?.avatarPath, 72)
-            Spacer(Modifier.height(16.dp))
-            Text(account?.name ?: "Glazegram", style = MaterialTheme.typography.titleLarge)
+    ModalDrawerSheet(
+        modifier = Modifier.width(304.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 20.dp, bottom = 16.dp)) {
+            GlazegramAvatar(account?.name ?: "Glazegram", account?.avatarPath, size = 56.dp)
+            Spacer(Modifier.height(12.dp))
+            Text(
+                account?.name ?: "Glazegram",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (!account?.detail.isNullOrBlank()) {
-                Text(account?.detail.orEmpty(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    account?.detail.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
-        HorizontalDivider()
+        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+        Spacer(Modifier.height(8.dp))
         NavigationDrawerItem(
-            label = { Text("Чаты") },
+            icon = { Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, modifier = Modifier.size(22.dp)) },
+            label = { Text("Чаты", style = MaterialTheme.typography.labelLarge) },
             selected = destination == MainDestination.Chats,
             onClick = { onDestination(MainDestination.Chats) },
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            shape = MaterialTheme.shapes.medium,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
         )
         NavigationDrawerItem(
-            icon = { Icon(Icons.Default.Settings, contentDescription = null) },
-            label = { Text("Настройки") },
+            icon = { Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(22.dp)) },
+            label = { Text("Настройки", style = MaterialTheme.typography.labelLarge) },
             selected = destination == MainDestination.Settings,
             onClick = { onDestination(MainDestination.Settings) },
+            shape = MaterialTheme.shapes.medium,
             modifier = Modifier.padding(horizontal = 12.dp),
         )
     }
 }
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ChatListScreen(
@@ -309,30 +383,102 @@ private fun ChatListScreen(
     onMenu: () -> Unit,
     onChat: (Long) -> Unit,
 ) {
+    val chatListLoaded by TdLibRuntime.chatListLoaded.collectAsState()
+    var searchMode by rememberSaveable { mutableStateOf(false) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    val focus = remember { FocusRequester() }
+    val visibleChats = remember(chats, searchQuery) {
+        if (searchQuery.isBlank()) chats
+        else chats.filter { it.title.contains(searchQuery, ignoreCase = true) }
+    }
+
+    BackHandler(enabled = searchMode) {
+        searchMode = false
+        searchQuery = ""
+    }
     Scaffold(
         topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("Glazegram") },
-                navigationIcon = {
-                    IconButton(onClick = onMenu) {
-                        Icon(Icons.Default.Menu, contentDescription = "Открыть меню")
-                    }
-                },
-            )
+            if (!searchMode) {
+                TopAppBar(
+                    title = {
+                        Text(
+                            "Glazegram",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onMenu) {
+                            Icon(Icons.Default.Menu, contentDescription = "Открыть меню")
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { searchMode = true }) {
+                            Icon(Icons.Default.Search, contentDescription = "Поиск")
+                        }
+                    },
+                )
+            } else {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = {
+                            searchMode = false
+                            searchQuery = ""
+                        }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад")
+                        }
+                    },
+                    title = {
+                        TextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Поиск", style = MaterialTheme.typography.bodyLarge) },
+                            singleLine = true,
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                                unfocusedContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                                disabledContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                                focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                                unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                            ),
+                            textStyle = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                        )
+                    },
+                    actions = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Очистить")
+                            }
+                        }
+                    },
+                )
+                LaunchedEffect(Unit) { focus.requestFocus() }
+            }
         },
     ) { padding ->
-        if (chats.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
-            }
-        } else {
-            LazyColumn(
+        when {
+            !chatListLoaded && chats.isEmpty() ->
+                LoadingState(Modifier.padding(padding))
+            chats.isEmpty() ->
+                EmptyState(
+                    title = "Пока нет чатов",
+                    subtitle = "Начните переписку — она появится здесь",
+                    modifier = Modifier.padding(padding),
+                )
+            visibleChats.isEmpty() ->
+                EmptyState(
+                    title = "Ничего не найдено",
+                    subtitle = "Попробуйте изменить запрос",
+                    modifier = Modifier.padding(padding),
+                )
+            else -> LazyColumn(
                 state = listState,
+                contentPadding = PaddingValues(top = Spacing.xs, bottom = Spacing.lg),
                 modifier = Modifier.fillMaxSize().padding(padding),
             ) {
-                items(chats, key = { it.id }, contentType = { "chat" }) { chat ->
+                items(visibleChats, key = { it.id }, contentType = { "chat" }) { chat ->
                     ChatListItem(chat, onClick = { onChat(chat.id) })
-                    HorizontalDivider(modifier = Modifier.padding(start = 88.dp))
                 }
             }
         }
@@ -341,35 +487,80 @@ private fun ChatListScreen(
 
 @Composable
 private fun ChatListItem(chat: ChatSummary, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    ListItem(
-        headlineContent = {
-            Text(chat.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        },
-        supportingContent = {
+    val unread = chat.unreadCount > 0
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 72.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+    ) {
+        GlazegramAvatar(chat.title, chat.avatarPath, size = 54.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
-                listOf(chat.lastMessageAuthor, chat.lastMessage)
-                    .filter(String::isNotBlank).joinToString(": "),
+                chat.title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Medium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-        },
-        leadingContent = { ChatAvatar(chat.title, chat.avatarPath) },
-        trailingContent = {
-            Column(horizontalAlignment = Alignment.End) {
-                Text(chat.lastMessageTime, style = MaterialTheme.typography.labelSmall)
-                if (chat.isPinned) Text("PIN", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
-                if (chat.unreadMentionCount > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    Badge { Text("@${chat.unreadMentionCount}") }
+            if (chat.lastMessage.isNotBlank()) {
+                Text(
+                    chat.lastMessage,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (chat.lastMessageIsOutgoing && chat.lastMessageDeliveryState != null) {
+                    val (icon, cd, tint) = when (chat.lastMessageDeliveryState) {
+                        DeliveryState.Sending -> Triple(Icons.Default.Schedule, "Отправляется", MaterialTheme.colorScheme.onSurfaceVariant)
+                        DeliveryState.Sent -> Triple(Icons.Default.Done, "Отправлено", MaterialTheme.colorScheme.onSurfaceVariant)
+                        DeliveryState.Read -> Triple(Icons.Default.DoneAll, "Прочитано", MaterialTheme.colorScheme.primary)
+                        DeliveryState.Failed -> Triple(Icons.Default.ErrorOutline, "Ошибка", MaterialTheme.colorScheme.error)
+                    }
+                    Icon(icon, contentDescription = cd, tint = tint, modifier = Modifier.size(14.dp))
                 }
-                if (chat.unreadCount > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    Badge { Text(chat.unreadCount.toString()) }
+                if (chat.isPinned) {
+                    Icon(
+                        Icons.Default.PushPin,
+                        contentDescription = "Закреплён",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+                if (chat.lastMessageTime.isNotBlank()) {
+                    Text(
+                        chat.lastMessageTime,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (unread) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
-        },
-        modifier = modifier.fillMaxWidth().clickable(onClick = onClick),
-    )
+            if (chat.unreadMentionCount > 0 || unread) {
+                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.xs), verticalAlignment = Alignment.CenterVertically) {
+                    if (chat.unreadMentionCount > 0) {
+                        Badge(containerColor = MaterialTheme.colorScheme.primary) { Text("@") }
+                    }
+                    if (unread) {
+                        Badge(containerColor = if (chat.isMuted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary) {
+                            Text(
+                                if (chat.unreadCount > 999) "999+" else chat.unreadCount.toString(),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -391,21 +582,26 @@ private fun SettingsScreen(account: AccountSummary?, onMenu: () -> Unit) {
             )
         },
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
+        Column(Modifier.fillMaxSize().padding(padding).padding(Spacing.lg)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                ChatAvatar(account?.name ?: "Glazegram", account?.avatarPath, 64)
-                Spacer(Modifier.width(16.dp))
+                GlazegramAvatar(account?.name ?: "Glazegram", account?.avatarPath, size = 64.dp)
+                Spacer(Modifier.width(Spacing.lg))
                 Column {
                     Text(account?.name ?: "Glazegram", style = MaterialTheme.typography.titleMedium)
-                    Text(account?.detail.orEmpty(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        account?.detail.orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
-            Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(Spacing.xl))
             ListItem(
+                leadingContent = { Icon(Icons.Default.CleaningServices, contentDescription = null) },
                 headlineContent = { Text("Очистить кэш") },
                 supportingContent = { Text("Удалить загруженные медиафайлы TDLib") },
                 trailingContent = { if (clearingCache) CircularProgressIndicator(Modifier.size(24.dp)) },
-                modifier = Modifier.clip(RoundedCornerShape(16.dp)).clickable(enabled = !clearingCache) {
+                modifier = Modifier.clip(MaterialTheme.shapes.medium).clickable(enabled = !clearingCache) {
                     clearingCache = true
                     TdLibRuntime.clearCache { success ->
                         scope.launch {
@@ -420,8 +616,21 @@ private fun SettingsScreen(account: AccountSummary?, onMenu: () -> Unit) {
                 },
             )
             ListItem(
+                leadingContent = { Icon(Icons.Default.BugReport, contentDescription = null) },
+                headlineContent = { Text("Диагностика") },
+                supportingContent = { Text("Уровень логов: ${com.glazegram.diagnostics.GlazeLog.level}") },
+                modifier = Modifier.clip(MaterialTheme.shapes.medium).clickable {
+                    com.glazegram.diagnostics.GlazeLog.level = when (com.glazegram.diagnostics.GlazeLog.level) {
+                        com.glazegram.diagnostics.LogLevel.OFF -> com.glazegram.diagnostics.LogLevel.BASIC
+                        com.glazegram.diagnostics.LogLevel.BASIC -> com.glazegram.diagnostics.LogLevel.VERBOSE
+                        com.glazegram.diagnostics.LogLevel.VERBOSE -> com.glazegram.diagnostics.LogLevel.OFF
+                    }
+                },
+            )
+            ListItem(
+                leadingContent = { Icon(Icons.Default.Logout, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
                 headlineContent = { Text("Выйти из аккаунта", color = MaterialTheme.colorScheme.error) },
-                modifier = Modifier.clip(RoundedCornerShape(16.dp)).clickable { confirmLogout = true },
+                modifier = Modifier.clip(MaterialTheme.shapes.medium).clickable { confirmLogout = true },
             )
         }
     }
@@ -529,28 +738,33 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
 
     Scaffold(
         topBar = {
-            CenterAlignedTopAppBar(
-                title = {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            chat.title,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.titleMedium,
-                        )
-                        Text(
-                            chat.subtitle,
-                            color = MaterialTheme.colorScheme.primary,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                },
+            TopAppBar(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад")
                     }
                 },
-                actions = { ChatAvatar(chat.title, chat.avatarPath, 40) },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        GlazegramAvatar(chat.title, chat.avatarPath, size = 40.dp)
+                        Spacer(Modifier.width(Spacing.md))
+                        Column {
+                            Text(
+                                chat.title,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                chat.subtitle,
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                },
             )
         },
         bottomBar = {
@@ -571,20 +785,13 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            MaterialTheme.colorScheme.surface,
-                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f),
-                            MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.20f),
-                        ),
-                    ),
-                ),
+                .background(MaterialTheme.colorScheme.surface),
         ) {
             LazyColumn(
                 state = listState,
                 reverseLayout = true,
-                contentPadding = PaddingValues(vertical = 10.dp),
+                contentPadding = PaddingValues(vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
                 items(state.items, key = { it.key }, contentType = { it::class }) { item ->
@@ -598,6 +805,9 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
                                     it !in state.unavailableReplyIds
                             } == true,
                             highlighted = state.highlightedMessageId == item.message.id,
+                            joinsNewer = item.joinsNewer,
+                            joinsOlder = item.joinsOlder,
+                            isGroup = chat.kind == com.glazegram.tdlib.ChatKind.BasicGroup || chat.kind == com.glazegram.tdlib.ChatKind.Supergroup,
                             modifier = Modifier.animateItem(),
                             onActions = { viewModel.showActions(item.message) },
                             onSwipeReply = { viewModel.reply(item.message) },
@@ -607,7 +817,10 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
                         is MessageListItem.Album -> AlbumBubble(
                             album = item,
                             highlightedMessageId = state.highlightedMessageId,
+                            isGroup = chat.kind == com.glazegram.tdlib.ChatKind.BasicGroup || chat.kind == com.glazegram.tdlib.ChatKind.Supergroup,
+                            modifier = Modifier.animateItem(),
                             onActions = viewModel::showActions,
+                            onSwipeReply = { viewModel.reply(item.messages.first()) },
                             onOpenMedia = { selectedMediaId = it.id },
                         )
                     }
@@ -629,10 +842,16 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
                             state.items.firstOrNull()?.messages?.map { it.id }?.let(viewModel::viewMessages)
                         }
                     },
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).size(52.dp),
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).size(48.dp),
                 ) {
                     val count = maxOf(unseenCount, chat.unreadCount)
-                    Text(if (count > 0) "↓$count" else "↓", fontWeight = FontWeight.Bold)
+                    if (count > 0) {
+                        BadgedBox(badge = { Badge { Text(count.toString()) } }) {
+                            Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Вниз к непрочитанным")
+                        }
+                    } else {
+                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Прокрутить вниз")
+                    }
                 }
             }
         }
@@ -643,34 +862,120 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
         }
     }
     state.actionTarget?.let { target ->
-        ModalBottomSheet(onDismissRequest = viewModel::dismissActions) {
-            if (target.text.isNotBlank()) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        val focusManager = LocalFocusManager.current
+        val keyboardController = LocalSoftwareKeyboardController.current
+        LaunchedEffect(target.id) {
+            focusManager.clearFocus(force = true)
+            keyboardController?.hide()
+        }
+        ModalBottomSheet(
+            onDismissRequest = viewModel::dismissActions,
+            sheetState = sheetState,
+        ) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding(),
+            ) {
                 ListItem(
-                    headlineContent = { Text("Копировать") },
-                    modifier = Modifier.clickable {
-                        context.getSystemService(ClipboardManager::class.java)
-                            .setPrimaryClip(ClipData.newPlainText("message", target.text))
-                        viewModel.dismissActions()
-                    },
+                    headlineContent = { Text("Ответить") },
+                    modifier = Modifier.clickable { viewModel.reply(target) },
                 )
-            }
-            state.deleteCapability?.let { capability ->
-                if (capability.forSelf) {
+                if (target.text.isNotBlank()) {
                     ListItem(
-                        headlineContent = { Text("Удалить у меня", color = MaterialTheme.colorScheme.error) },
-                        modifier = Modifier.clickable { viewModel.delete(target, forEveryone = false) },
+                        headlineContent = { Text("Копировать") },
+                        modifier = Modifier.clickable {
+                            context.getSystemService(ClipboardManager::class.java)
+                                .setPrimaryClip(ClipData.newPlainText("message", target.text))
+                            viewModel.dismissActions()
+                        },
                     )
                 }
-                if (capability.forEveryone) {
-                    ListItem(
-                        headlineContent = { Text("Удалить у всех", color = MaterialTheme.colorScheme.error) },
-                        modifier = Modifier.clickable { viewModel.delete(target, forEveryone = true) },
-                    )
+                state.deleteCapability?.let { capability ->
+                    if (capability.forSelf) {
+                        ListItem(
+                            headlineContent = { Text("Удалить у меня", color = MaterialTheme.colorScheme.error) },
+                            modifier = Modifier.clickable { viewModel.delete(target, forEveryone = false) },
+                        )
+                    }
+                    if (capability.forEveryone) {
+                        ListItem(
+                            headlineContent = { Text("Удалить у всех", color = MaterialTheme.colorScheme.error) },
+                            modifier = Modifier.clickable { viewModel.delete(target, forEveryone = true) },
+                        )
+                    }
                 }
+                Spacer(Modifier.height(Spacing.lg))
             }
-            Spacer(Modifier.height(24.dp))
         }
     }
+}
+
+/**
+ * Telegram-style swipe-to-reply arbitration (TGA/TGX-verified behavior):
+ * - physical LEFT swipe only, identical for incoming/outgoing;
+ * - starts only on a clear leftward lock beyond touch slop;
+ * - refuses to start near screen edges so system back gesture wins;
+ * - dp-based trigger/cap (TGX-like 42dp/64dp), not raw pixels;
+ * - vertical scrolling is untouched: detectHorizontalDragGestures only locks
+ *   after horizontal slop, and we additionally require leftward dominance.
+ */
+@Composable
+private fun Modifier.replySwipe(
+    key: Long,
+    enabled: Boolean = true,
+    onReply: () -> Unit,
+): Modifier {
+    val scope = rememberCoroutineScope()
+    val offset = remember(key) { Animatable(0f) }
+    val view = LocalView.current
+    return this
+        .graphicsLayer { translationX = offset.value }
+        .pointerInput(key, enabled) {
+            if (!enabled) return@pointerInput
+            val maxPx = 64.dp.toPx()
+            val triggerPx = 36.dp.toPx()
+            val edgePx = 28.dp.toPx()
+            val slop = viewConfiguration.touchSlop
+            var translating = false
+            var startX = 0f
+            detectHorizontalDragGestures(
+                onDragStart = { start ->
+                    startX = start.x
+                    translating = false
+                },
+                onHorizontalDrag = { change, dragAmount ->
+                    if (!translating) {
+                        val width = size.width.toFloat()
+                        val x = change.position.x
+                        // Back-edge protection: never hijack system navigation zones.
+                        if (startX < edgePx || startX > width - edgePx) return@detectHorizontalDragGestures
+                        when {
+                            x < startX - slop -> translating = true // clear leftward intent
+                            x > startX + slop -> return@detectHorizontalDragGestures // rightward: not ours
+                            else -> return@detectHorizontalDragGestures // undecided
+                        }
+                    }
+                    change.consume()
+                    val next = (offset.value + dragAmount).coerceIn(-maxPx, 0f)
+                    scope.launch { offset.snapTo(next) }
+                },
+                onDragEnd = {
+                    if (translating && offset.value <= -triggerPx) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        onReply()
+                    }
+                    translating = false
+                    scope.launch { offset.animateTo(0f, spring()) }
+                },
+                onDragCancel = {
+                    translating = false
+                    scope.launch { offset.animateTo(0f, spring()) }
+                },
+            )
+        }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -681,15 +986,15 @@ private fun MessageBubble(
     replyUnavailable: Boolean,
     replyLoading: Boolean,
     highlighted: Boolean,
+    joinsNewer: Boolean,
+    joinsOlder: Boolean,
+    isGroup: Boolean,
     modifier: Modifier = Modifier,
     onActions: () -> Unit,
     onSwipeReply: () -> Unit,
     onReplyClick: () -> Unit,
     onOpenMedia: () -> Unit,
 ) {
-    val swipeOffset = remember(message.id) { Animatable(0f) }
-    val swipeScope = rememberCoroutineScope()
-    val swipeDirection = if (message.isOutgoing) -1f else 1f
     val bubbleColor by animateColorAsState(
         targetValue = if (highlighted || message.containsUnreadMention) MaterialTheme.colorScheme.tertiaryContainer
         else if (message.isOutgoing) MaterialTheme.colorScheme.primaryContainer
@@ -699,43 +1004,55 @@ private fun MessageBubble(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .graphicsLayer { translationX = swipeOffset.value }
-            .pointerInput(message.id, message.isOutgoing) {
-                detectHorizontalDragGestures(
-                    onHorizontalDrag = { change, dragAmount ->
-                        val next = (swipeOffset.value + dragAmount)
-                            .coerceIn(if (message.isOutgoing) -120f else 0f, if (message.isOutgoing) 0f else 120f)
-                        if (dragAmount * swipeDirection > 0) change.consume()
-                        swipeScope.launch { swipeOffset.snapTo(next) }
-                    },
-                    onDragEnd = {
-                        if (abs(swipeOffset.value) >= 72f) onSwipeReply()
-                        swipeScope.launch { swipeOffset.animateTo(0f, spring()) }
-                    },
-                    onDragCancel = { swipeScope.launch { swipeOffset.animateTo(0f, spring()) } },
-                )
-            }
-            .padding(horizontal = 12.dp, vertical = 3.dp),
+            .padding(top = if (joinsOlder) 2.dp else 10.dp)
+            .replySwipe(message.id) { onSwipeReply() }
+            .padding(horizontal = 12.dp),
         horizontalArrangement = if (message.isOutgoing) Arrangement.End else Arrangement.Start,
     ) {
-        if (!message.isOutgoing) {
-            ChatAvatar(message.author, message.authorAvatarPath, 32)
-            Spacer(Modifier.width(6.dp))
+        // Visual mapping for reverseLayout=true: older neighbor is visually above, newer below.
+        // joinsOlder -> joins message above (small top gap, tight top corners, name at top)
+        // joinsNewer -> joins message below (tight bottom corners, avatar at bottom)
+        val showName = isGroup && !joinsOlder && !message.isOutgoing
+        val showAvatar = isGroup && !joinsNewer && !message.isOutgoing
+        if (isGroup && !message.isOutgoing) {
+            if (showAvatar) {
+                GlazegramAvatar(message.author, message.authorAvatarPath, size = 32.dp)
+                Spacer(Modifier.width(6.dp))
+            } else {
+                Spacer(Modifier.width(38.dp))
+            }
         }
         Surface(
             color = bubbleColor,
-            shape = if (message.isOutgoing) RoundedCornerShape(20.dp, 20.dp, 5.dp, 20.dp)
-            else RoundedCornerShape(20.dp, 20.dp, 20.dp, 5.dp),
-            tonalElevation = 1.dp,
-            shadowElevation = 1.dp,
+            shape = when {
+                message.isOutgoing -> RoundedCornerShape(
+                    topStart = if (joinsOlder) 8.dp else 20.dp,
+                    topEnd = 20.dp,
+                    bottomEnd = if (joinsNewer) 8.dp else 5.dp,
+                    bottomStart = 20.dp,
+                )
+                else -> RoundedCornerShape(
+                    topStart = if (joinsOlder) 8.dp else 20.dp,
+                    topEnd = 20.dp,
+                    bottomEnd = 20.dp,
+                    bottomStart = if (joinsNewer) 8.dp else 5.dp,
+                )
+            },
+            tonalElevation = 0.dp,
             modifier = Modifier
                 .widthIn(max = 340.dp)
                 .animateContentSize()
                 .combinedClickable(onClick = {}, onLongClick = onActions),
         ) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                if (!message.isOutgoing) {
-                    Text(message.author, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
+                if (showName) {
+                    Text(
+                        message.author,
+                        color = com.glazegram.ui.theme.senderColor(message.senderKey),
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
                 if (message.containsUnreadMention) {
                     Text("Упоминание @", color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.labelSmall)
@@ -779,17 +1096,19 @@ private fun MessageBubble(
                 Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
                     Text(message.time, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
                     if (message.isOutgoing) {
-                        Spacer(Modifier.width(5.dp))
-                        Text(
-                            when (message.deliveryState) {
-                                DeliveryState.Sending -> "…"
-                                DeliveryState.Sent -> "✓"
-                                DeliveryState.Read -> "✓✓"
-                                DeliveryState.Failed -> "!"
-                            },
-                            color = if (message.deliveryState == DeliveryState.Failed) MaterialTheme.colorScheme.error
+                        Spacer(Modifier.width(4.dp))
+                        val (icon, description) = when (message.deliveryState) {
+                            DeliveryState.Sending -> Icons.Default.Schedule to "Отправляется"
+                            DeliveryState.Sent -> Icons.Default.Done to "Отправлено"
+                            DeliveryState.Read -> Icons.Default.DoneAll to "Прочитано"
+                            DeliveryState.Failed -> Icons.Default.ErrorOutline to "Ошибка отправки"
+                        }
+                        Icon(
+                            icon,
+                            contentDescription = description,
+                            tint = if (message.deliveryState == DeliveryState.Failed) MaterialTheme.colorScheme.error
                             else MaterialTheme.colorScheme.primary,
-                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.size(14.dp),
                         )
                     }
                 }
@@ -832,18 +1151,32 @@ private fun FormattedMessageText(message: ChatMessage) {
 private fun AlbumBubble(
     album: MessageListItem.Album,
     highlightedMessageId: Long?,
+    isGroup: Boolean,
+    modifier: Modifier = Modifier,
     onActions: (ChatMessage) -> Unit,
+    onSwipeReply: () -> Unit,
     onOpenMedia: (ChatMessage) -> Unit,
 ) {
     val outgoing = album.messages.first().isOutgoing
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = if (album.joinsOlder) 2.dp else 10.dp)
+            .replySwipe(album.albumId) { onSwipeReply() }
+            .padding(horizontal = 12.dp),
         horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start,
     ) {
-        if (!outgoing) {
-            val author = album.messages.first()
-            ChatAvatar(author.author, author.authorAvatarPath, 32)
-            Spacer(Modifier.width(6.dp))
+        // reverseLayout: older above, newer below
+        val showName = isGroup && !outgoing && !album.joinsOlder
+        val showAvatar = isGroup && !outgoing && !album.joinsNewer
+        if (isGroup && !outgoing) {
+            if (showAvatar) {
+                val author = album.messages.first()
+                GlazegramAvatar(author.author, author.authorAvatarPath, size = 32.dp)
+                Spacer(Modifier.width(6.dp))
+            } else {
+                Spacer(Modifier.width(38.dp))
+            }
         }
         Surface(
             color = if (album.containsMessage(highlightedMessageId ?: Long.MIN_VALUE)) {
@@ -853,10 +1186,30 @@ private fun AlbumBubble(
             } else {
                 MaterialTheme.colorScheme.surfaceContainerHigh
             },
-            shape = RoundedCornerShape(18.dp),
+            shape = when {
+                outgoing -> RoundedCornerShape(
+                    topStart = if (album.joinsOlder) 8.dp else 20.dp,
+                    bottomEnd = if (album.joinsNewer) 8.dp else 5.dp,
+                )
+                else -> RoundedCornerShape(
+                    topStart = if (album.joinsOlder) 8.dp else 20.dp,
+                    bottomStart = if (album.joinsNewer) 8.dp else 5.dp,
+                )
+            },
             modifier = Modifier.widthIn(max = 340.dp),
         ) {
             Column(Modifier.padding(4.dp)) {
+                if (showName) {
+                    val first = album.messages.first()
+                    Text(
+                        first.author,
+                        color = com.glazegram.ui.theme.senderColor(first.senderKey),
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    )
+                }
                 album.messages.chunked(2).forEach { rowMessages ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                         rowMessages.forEach { message ->
@@ -886,39 +1239,78 @@ private fun AlbumBubble(
 @Composable
 private fun MessageMedia(message: ChatMessage, onOpen: () -> Unit, compact: Boolean = false) {
     if (message.mediaKind == MediaKind.Text) return
-    val bitmap = remember(message.mediaPreviewPath, message.mediaMinithumbnail) {
-        message.mediaPreviewPath?.let(BitmapFactory::decodeFile)
-            ?: message.mediaMinithumbnail?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
-    }
+    val bitmap = rememberDecodedImage(
+        path = message.mediaPreviewPath,
+        minithumbnail = message.mediaMinithumbnail,
+    )
     val aspectRatio = if (message.mediaWidth > 0 && message.mediaHeight > 0) {
         (message.mediaWidth.toFloat() / message.mediaHeight).coerceIn(0.65f, 1.85f)
     } else {
         4f / 3f
     }
-    val mediaModifier = Modifier
-        .then(if (compact) Modifier.fillMaxWidth() else Modifier.widthIn(min = 120.dp, max = 300.dp))
-        .aspectRatio(aspectRatio)
-        .clip(RoundedCornerShape(if (compact) 10.dp else 14.dp))
-        .clickable(onClick = onOpen)
+    val isVisualMedia = message.mediaKind in setOf(
+        MediaKind.Photo,
+        MediaKind.Video,
+        MediaKind.VideoNote,
+        MediaKind.Animation,
+        MediaKind.Sticker,
+    )
+    val mediaModifier = if (isVisualMedia) {
+        Modifier
+            .then(if (compact) Modifier.fillMaxWidth() else Modifier.widthIn(min = 120.dp, max = 300.dp))
+            .aspectRatio(aspectRatio)
+            .clip(RoundedCornerShape(if (compact) 10.dp else 14.dp))
+            .clickable(onClick = onOpen)
+    } else {
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .clip(RoundedCornerShape(12.dp))
+    }
     if (bitmap != null) {
         Box(mediaModifier) {
             Image(
-                bitmap = bitmap.asImageBitmap(),
+                bitmap = bitmap,
                 contentDescription = message.mediaLabel,
                 contentScale = if (message.mediaKind == MediaKind.Sticker) ContentScale.Fit else ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
+            if (message.mediaPreviewPath == null) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.28f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(28.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
+            }
             if (message.mediaKind in setOf(MediaKind.Video, MediaKind.VideoNote, MediaKind.Animation)) {
-                Text(
-                    text = if (message.mediaKind == MediaKind.Animation) "GIF" else "▶ ${message.mediaLabel.orEmpty()}",
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    style = MaterialTheme.typography.labelMedium,
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .padding(6.dp)
                         .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
                         .padding(horizontal = 6.dp, vertical = 3.dp),
-                )
+                ) {
+                    Icon(
+                        Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        text = if (message.mediaKind == MediaKind.Animation) "GIF" else message.mediaLabel.orEmpty(),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
             }
         }
         if (!compact && !message.mediaLabel.isNullOrBlank() && message.mediaKind in setOf(
@@ -933,17 +1325,64 @@ private fun MessageMedia(message: ChatMessage, onOpen: () -> Unit, compact: Bool
                 style = MaterialTheme.typography.labelMedium,
             )
         }
-    } else {
-        Surface(
-            color = MaterialTheme.colorScheme.secondaryContainer,
-            shape = RoundedCornerShape(12.dp),
-            modifier = mediaModifier,
+    } else if (isVisualMedia) {
+        Box(
+            mediaModifier.background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
         ) {
-            Box(contentAlignment = Alignment.Center) {
-                Text(message.mediaLabel ?: "Медиа", style = MaterialTheme.typography.labelLarge)
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+                if (message.mediaPreviewPath == null) {
+                    CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(
+                        Icons.Default.Image,
+                        contentDescription = message.mediaLabel ?: "Медиа",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(32.dp),
+                    )
+                }
+                if (message.mediaPreviewPath == null) {
+                    Text(
+                        "Загрузка…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
-        if (!compact) Spacer(Modifier.height(4.dp))
+    } else {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = RoundedCornerShape(12.dp),
+            modifier = mediaModifier.clickable(onClick = onOpen),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Spacing.md),
+                modifier = Modifier.padding(horizontal = Spacing.md, vertical = Spacing.sm),
+            ) {
+                val icon = when (message.mediaKind) {
+                    MediaKind.Document -> Icons.Default.Description
+                    MediaKind.Voice -> Icons.AutoMirrored.Filled.VolumeUp
+                    MediaKind.Audio -> Icons.AutoMirrored.Filled.VolumeUp
+                    else -> Icons.Default.Description
+                }
+                Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp),
+                )
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        message.mediaLabel ?: "Медиа",
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -963,10 +1402,10 @@ private fun MediaViewer(chatId: Long, message: ChatMessage, onDismiss: () -> Uni
                 when {
                     path == null -> CircularProgressIndicator(Modifier.align(Alignment.Center))
                     message.mediaKind in setOf(MediaKind.Photo, MediaKind.Sticker) -> {
-                        val bitmap = remember(path) { BitmapFactory.decodeFile(path) }
+                        val bitmap = rememberDecodedImage(path = path)
                         if (bitmap != null) {
                             Image(
-                                bitmap.asImageBitmap(),
+                                bitmap = bitmap,
                                 contentDescription = null,
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier.fillMaxSize(),
@@ -1033,69 +1472,84 @@ private fun MessageComposer(
     onCancelReply: () -> Unit,
     onSend: () -> Unit,
 ) {
-    Surface(
-        tonalElevation = 4.dp,
-        shadowElevation = 8.dp,
-        modifier = Modifier.navigationBarsPadding(),
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow)
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(horizontal = Spacing.sm, vertical = Spacing.xs),
     ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
-            if (replyTo != null) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
-                        Text("Ответ: ${replyTo.author}", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
-                        Text(
-                            replyTo.text.ifBlank { replyTo.contentPreview },
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    IconButton(onClick = onCancelReply) {
-                        Icon(Icons.Default.Close, contentDescription = "Отменить ответ")
-                    }
-                }
-            }
-            Row(verticalAlignment = Alignment.Bottom) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = onDraft,
-                    placeholder = { Text("Сообщение") },
-                    maxLines = 5,
-                    keyboardOptions = KeyboardOptions(
-                        capitalization = KeyboardCapitalization.Sentences,
-                        imeAction = ImeAction.Send,
-                    ),
-                    keyboardActions = KeyboardActions(onSend = { onSend() }),
-                    shape = RoundedCornerShape(26.dp),
-                    modifier = Modifier.weight(1f),
+        if (replyTo != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .width(3.dp)
+                        .height(36.dp)
+                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp)),
                 )
-                Spacer(Modifier.width(6.dp))
-                FilledTonalIconButton(onClick = onSend, enabled = draft.isNotBlank()) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
+                Spacer(Modifier.width(Spacing.md))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        replyTo.author,
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        replyTo.text.ifBlank { replyTo.contentPreview },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                IconButton(onClick = onCancelReply, modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "Отменить ответ", modifier = Modifier.size(18.dp))
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun ChatAvatar(title: String, path: String?, size: Int = 52) {
-    val bitmap = remember(path) { path?.let(BitmapFactory::decodeFile) }
-    if (bitmap != null) {
-        Image(
-            bitmap = bitmap.asImageBitmap(),
-            contentDescription = title,
-            modifier = Modifier.size(size.dp).clip(CircleShape),
-        )
-    } else {
-        Box(
-            modifier = Modifier.size(size.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                title.firstOrNull()?.uppercase() ?: "?",
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                style = MaterialTheme.typography.titleMedium,
+        Row(verticalAlignment = Alignment.Bottom) {
+            TextField(
+                value = draft,
+                onValueChange = onDraft,
+                placeholder = { Text("Сообщение") },
+                maxLines = 5,
+                leadingIcon = {
+                    IconButton(
+                        onClick = {
+                            Toast.makeText(context, "Вложения пока недоступны", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(Icons.Default.AttachFile, contentDescription = "Прикрепить", modifier = Modifier.size(20.dp))
+                    }
+                },
+                keyboardOptions = KeyboardOptions(
+                    capitalization = KeyboardCapitalization.Sentences,
+                    imeAction = ImeAction.Send,
+                ),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                shape = RoundedCornerShape(24.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                    unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
+                ),
+                modifier = Modifier.weight(1f),
             )
+            Spacer(Modifier.width(Spacing.xs))
+            val sendInteraction = rememberPressInteraction()
+            FilledTonalIconButton(
+                onClick = onSend,
+                enabled = draft.isNotBlank(),
+                interactionSource = sendInteraction,
+                modifier = Modifier.padding(bottom = 6.dp).pressScale(sendInteraction),
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
+            }
         }
     }
 }

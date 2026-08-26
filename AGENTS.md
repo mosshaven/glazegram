@@ -7,17 +7,27 @@ using TDLib.
 
 ## Current phase
 
-We are currently implementing the functional client core.
+We are building a stable functional client core and its visual quality together.
+Functional correctness and UI quality are developed side by side; neither is
+postponed in favor of the other.
 
-Do NOT spend time on final visual design.
+## Design direction
 
-The final application will eventually support:
-- iOS-like UI
-- Material UI
-- Liquid Glass UI
-- extensive UI customization
+Material Design (Material 3, including dynamic Monet color) is the active,
+primary Glazegram design system.
 
-These are NOT priorities during the current development phase.
+Reusable design-system work is allowed and expected:
+- theme tokens (color, typography, shape, spacing, motion);
+- reusable UI primitives and components;
+- polished app bars, lists, drawers, chat surfaces, composers and context actions.
+
+Broad speculative rewrites are still forbidden. Incremental, reviewable slices only.
+
+Future alternative appearance systems (an Apple-inspired mode, a Liquid
+Glass-inspired mode, extensive customization) are planned separately. They must
+NOT contaminate the current Material implementation: no parallel theming layers,
+no conditional visual modes, no abstraction "for future skins" beyond ordinary
+clean component boundaries.
 
 ## Platform
 
@@ -37,3 +47,8 @@ Do not implement:
 - TDLib
 - Kotlin Coroutines
 - Flow / StateFlow
+
+## Workflow
+
+Current work is defined by `docs/CURRENT_TASK.md`. Read it before coding.
+Follow `docs/WORKFLOW.md` for roles and process.

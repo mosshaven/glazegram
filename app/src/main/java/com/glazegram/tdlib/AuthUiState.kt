@@ -14,7 +14,41 @@ data class ChatSummary(
     val subtitle: String,
     val canSendMessages: Boolean,
     val unreadMentionCount: Int,
+    val lastMessageIsOutgoing: Boolean = false,
+    val lastMessageDeliveryState: DeliveryState? = null,
+    val isMuted: Boolean = false,
+    val isSavedMessages: Boolean = false,
 )
+
+/**
+ * Composes the single-line chat-list preview using semantic metadata only.
+ * Display string "Вы" is presentation-only and never used for branching.
+ *
+ * Rules:
+ * - CHANNEL: bare preview (no sender prefix)
+ * - SAVED: bare preview (do not duplicate title)
+ * - PRIVATE incoming: preview
+ * - PRIVATE outgoing: "Вы: preview"
+ * - GROUP / SUPERGROUP incoming: "Author: preview"
+ * - GROUP / SUPERGROUP outgoing: "Вы: preview"
+ */
+fun chatListPreview(
+    author: String,
+    preview: String,
+    kind: ChatKind,
+    isOutgoing: Boolean,
+    isSavedMessages: Boolean = false,
+): String {
+    if (preview.isBlank()) return ""
+    if (isSavedMessages) return preview
+    if (kind == ChatKind.Channel) return preview
+    return when {
+        isOutgoing -> "Вы: $preview"
+        kind == ChatKind.BasicGroup || kind == ChatKind.Supergroup ->
+            if (author.isNotBlank()) "$author: $preview" else preview
+        else -> preview
+    }
+}
 
 enum class ChatKind { Private, BasicGroup, Supergroup, Channel, Secret }
 
@@ -43,6 +77,12 @@ data class ChatMessage(
     val forwardedFrom: String? = null,
     val containsUnreadMention: Boolean = false,
     val contentPreview: String = "",
+    /** Epoch seconds; presentation-layer cluster boundaries only. */
+    val date: Int = 0,
+    /** Stable sender identity for clustering, e.g. "u:123" / "c:-100…". */
+    val senderKey: String = "",
+    /** Service/system messages always break clusters. */
+    val isService: Boolean = false,
 )
 
 data class MessageTextStyle(

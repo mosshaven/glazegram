@@ -70,6 +70,29 @@ Per-chat state holder. Объединяет runtime flows с interaction state: 
 
 TDLib database directory находится внутри `Context.filesDir/tdlib`. Поэтому повторный запуск приложения позволяет TDLib восстановить сессию без отдельного хранилища Telegram-данных.
 
+## UI Architecture
+
+Material 3 — активная дизайн-система. Структура инкрементальная:
+
+### Theme tokens (`ui/theme/`)
+
+- `GlazegramTheme` — входная тема: dynamic Monet color scheme на Android 12+, fallback schemes, luminance-based system bar icons, wiring typography и shapes.
+- `Type.kt` — типографическая шкала Material roles с единой точкой смены font family (бинарные шрифты не добавлены; архитектура позволяет выбрать шрифт позже).
+- `Shape.kt` — шкала форм (extraSmall → extraLarge).
+- `Spacing.kt` — токены отступов (xs → xxl).
+- `Motion.kt` — общие duration/easing токены для согласованной анимации.
+
+### Reusable components (`ui/components/`)
+
+- `rememberDecodedImage` — граница асинхронной загрузки изображений: decode на `Dispatchers.IO`, результат в Compose state, bounded LRU memory cache, ключи различают file path и byte-данные (minithumbnail). Используется аватарами, media previews и media viewer.
+- `GlazegramAvatar` — аватар: async image + initials fallback.
+- `EmptyState` — примитив пустых состояний.
+- `Modifier.pressScale` — тактильный press-feedback (scale-on-press) на motion-токенах.
+
+### Feature composables
+
+Feature-экраны (chat list, chat, settings, auth) пока расположены в `MainActivity.kt`. Вынос в feature-пакеты запланирован отдельным рефакторингом; новые экраны должны размещаться в feature-пакетах сразу.
+
 ### `MainActivity`
 
 Единственная Activity текущей версии. Устанавливает Compose content и отображает authorization screen.
@@ -78,7 +101,7 @@ Authorization и временные Compose screens пока находятся 
 
 ## UI Theme
 
-`GlazegramTheme` использует Material 3. На Android 12+ цвета берутся из системной dynamic color scheme (Monet); на старых версиях используются Material fallback color schemes. Текущая тема поддерживает light/dark mode через системную настройку.
+`GlazegramTheme` использует Material 3. На Android 12+ цвета берутся из системной dynamic color scheme (Monet); на старых версиях используются Material fallback color schemes. Текущая тема поддерживает light/dark mode через системную настройку. Детали в разделе UI Architecture.
 
 ## TDLib
 
@@ -115,9 +138,20 @@ Generated `BuildConfig` и APK могут содержать локально п
 │           ├── chat/
 │           │   ├── ChatViewModel.kt
 │           │   └── MessagePresentation.kt
-│           └── tdlib/
-│               ├── AuthUiState.kt
-│               └── TdLibRuntime.kt
+│           ├── tdlib/
+│           │   ├── AuthUiState.kt
+│           │   └── TdLibRuntime.kt
+│           ├── ui/components/
+│           │   ├── AsyncImage.kt
+│           │   ├── GlazegramAvatar.kt
+│           │   ├── PressScale.kt
+│           │   └── States.kt
+│           └── ui/theme/
+│               ├── GlazegramTheme.kt
+│               ├── Motion.kt
+│               ├── Shape.kt
+│               ├── Spacing.kt
+│               └── Type.kt
 ├── build.gradle.kts
 ├── settings.gradle.kts
 ├── gradle.properties
@@ -131,8 +165,7 @@ Generated `BuildConfig` и APK могут содержать локально п
 
 - serialized reducer вместо mutation из нескольких TDLib callbacks;
 - отдельные chat/message/file repositories без дублирования TDLib database;
-- вынос chat composables из `MainActivity`;
+- вынос chat composables из `MainActivity` в feature-пакеты;
 - album boundary completion и production mosaic calculator;
-- async size-aware image decoding.
 - persistent appearance preference вместо зависимости только от system theme;
 - reliable push notifications вместо постоянного foreground connection как единственного background mechanism.
