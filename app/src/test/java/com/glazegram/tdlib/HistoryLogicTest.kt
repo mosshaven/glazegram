@@ -179,6 +179,25 @@ class HistoryLogicTest {
         ).forEach { assertTrue(it.name, it.requestsMedia) }
     }
 
+    // ---- initial-loading visibility ----------------------------------------
+
+    @Test
+    fun initialSpinnerShowsBeforeAnyViewportIsReady() {
+        assertTrue(HistoryPolicy.initialLoadingVisible(initialInFlight = true, initialReady = false))
+    }
+
+    @Test
+    fun initialSpinnerHidesOnceALocalViewportIsPublishedWhileNetworkStillRuns() {
+        // Local page produced a usable viewport; the INITIAL request is still in flight.
+        assertFalse(HistoryPolicy.initialLoadingVisible(initialInFlight = true, initialReady = true))
+    }
+
+    @Test
+    fun initialSpinnerHiddenWhenNoInitialRequestIsInFlight() {
+        assertFalse(HistoryPolicy.initialLoadingVisible(initialInFlight = false, initialReady = false))
+        assertFalse(HistoryPolicy.initialLoadingVisible(initialInFlight = false, initialReady = true))
+    }
+
     private fun assertSameIds(expected: Array<TdApi.Message>, actual: Array<TdApi.Message>) {
         assertEquals(expected.map { it.id }, actual.map { it.id })
     }

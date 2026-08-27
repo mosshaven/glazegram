@@ -19,6 +19,7 @@ data class ChatScreenState(
     val messages: List<ChatMessage> = emptyList(),
     val items: List<MessageListItem> = emptyList(),
     val loadingOlder: Boolean = false,
+    val initialLoading: Boolean = false,
     val hasMore: Boolean = true,
     val replyTo: ChatMessage? = null,
     val actionTarget: ChatMessage? = null,
@@ -42,13 +43,15 @@ class ChatViewModel(private val chatId: Long) : ViewModel() {
         TdLibRuntime.messages,
         TdLibRuntime.historyLoading,
         TdLibRuntime.historyHasMore,
+        TdLibRuntime.historyInitialLoading,
         interaction,
-    ) { allMessages, loading, hasMore, local ->
+    ) { allMessages, loading, hasMore, initialLoading, local ->
         val messages = allMessages[chatId].orEmpty()
         local.copy(
             messages = messages,
             items = groupMessageAlbums(messages),
             loadingOlder = loading[chatId] == true,
+            initialLoading = initialLoading[chatId] == true,
             hasMore = hasMore[chatId] != false,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ChatScreenState())

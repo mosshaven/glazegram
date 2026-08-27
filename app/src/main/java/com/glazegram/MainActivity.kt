@@ -869,6 +869,12 @@ private fun ChatScreen(chat: ChatSummary, onBack: () -> Unit) {
                     }
                 }
             }
+            if (state.initialLoading && state.items.isEmpty()) {
+                CircularProgressIndicator(
+                    modifier = Modifier.align(Alignment.Center).size(36.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
             if (awayFromBottom || unseenCount > 0) {
                 FilledTonalIconButton(
                     onClick = {

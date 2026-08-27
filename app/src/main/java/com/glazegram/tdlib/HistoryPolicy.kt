@@ -34,4 +34,13 @@ object HistoryPolicy {
 
     fun shouldEvict(active: Boolean, retainedChats: Int, maxRetained: Int = MAX_RETAINED_CHATS): Boolean =
         !active && retainedChats > maxRetained
+
+    /**
+     * The initial spinner is shown only while the INITIAL request is in flight *and* no usable
+     * viewport has been published yet. A local page can publish a viewport (`initialReady`) while
+     * the INITIAL network stage keeps running to prove the boundary — that stage must not be
+     * surfaced as a full-screen load over already-visible messages.
+     */
+    fun initialLoadingVisible(initialInFlight: Boolean, initialReady: Boolean): Boolean =
+        initialInFlight && !initialReady
 }

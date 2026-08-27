@@ -32,6 +32,16 @@ object TdLibRuntime {
     val messages: StateFlow<Map<Long, List<ChatMessage>>> = mutableMessages.asStateFlow()
     private val mutableHistoryLoading = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
     val historyLoading: StateFlow<Map<Long, Boolean>> = mutableHistoryLoading.asStateFlow()
+    private val mutableHistoryInitialLoading = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
+
+    /**
+     * True only while the INITIAL request is in flight *and* no usable viewport has been
+     * published yet. Once a local page publishes a viewport the INITIAL request may still run
+     * (proving the boundary), but this flag drops to false so the UI never covers visible
+     * messages with the initial spinner. OLDER pagination is reported separately by
+     * [historyLoading].
+     */
+    val historyInitialLoading: StateFlow<Map<Long, Boolean>> = mutableHistoryInitialLoading.asStateFlow()
     private val mutableHistoryHasMore = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
     val historyHasMore: StateFlow<Map<Long, Boolean>> = mutableHistoryHasMore.asStateFlow()
     private val mutableAccount = MutableStateFlow<AccountSummary?>(null)
@@ -49,6 +59,12 @@ object TdLibRuntime {
         val state = history.peek(chatId) ?: return
         mutableHistoryLoading.value =
             mutableHistoryLoading.value + (chatId to state.isLoading(HistorySlot.OLDER))
+        mutableHistoryInitialLoading.value =
+            mutableHistoryInitialLoading.value +
+                (chatId to HistoryPolicy.initialLoadingVisible(
+                    initialInFlight = state.isLoading(HistorySlot.INITIAL),
+                    initialReady = state.initialReady,
+                ))
     }
 
     private fun syncHistoryHasMore(chatId: Long) {
@@ -383,6 +399,7 @@ object TdLibRuntime {
     /** Caller holds the history lock. */
     private fun loadInitial(chatId: Long) {
         val request = history.begin(chatId, HistorySlot.INITIAL) ?: return
+        syncHistoryLoading(chatId)
         val startedAt = SystemClock.elapsedRealtime()
         send(
             TdApi.GetChatHistory(chatId, 0, 0, HistoryPolicy.INITIAL_PAGE_SIZE, true),
@@ -427,6 +444,7 @@ object TdLibRuntime {
                         if (retained > 0) InitialOutcome.LOADED else InitialOutcome.EMPTY
                     history.completeInitial(request, outcome)
                     syncHistoryHasMore(chatId)
+                    syncHistoryLoading(chatId)
                     GlazeLog.historyNetwork(
                         chatId,
                         messages.size,
@@ -446,6 +464,7 @@ object TdLibRuntime {
                         if (retained > 0) InitialOutcome.LOADED else InitialOutcome.FAILED
                     history.completeInitial(request, outcome)
                     syncHistoryHasMore(chatId)
+                    syncHistoryLoading(chatId)
                 }
             },
         )
@@ -466,6 +485,7 @@ object TdLibRuntime {
             mergeMessages(chatId, buffered, HistoryLoadSource.REALTIME)
         }
         syncHistoryHasMore(chatId)
+        syncHistoryLoading(chatId)
     }
 
     /** Caller holds the history lock. */
