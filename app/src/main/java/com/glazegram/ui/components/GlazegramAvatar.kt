@@ -26,7 +26,7 @@ fun GlazegramAvatar(
     size: Dp = 52.dp,
     modifier: Modifier = Modifier,
 ) {
-    val bitmap = rememberDecodedImage(path = imagePath)
+    val bitmap = rememberDecodedImage(path = imagePath, targetDp = size.value.toInt())
     if (bitmap != null) {
         AvatarImage(bitmap, name, size, modifier)
     } else {

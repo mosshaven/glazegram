@@ -1285,9 +1285,14 @@ private fun AlbumBubble(
 @Composable
 private fun MessageMedia(message: ChatMessage, onOpen: () -> Unit, compact: Boolean = false) {
     if (message.mediaKind == MediaKind.Text) return
+    val isStickerLike = message.mediaKind == MediaKind.Sticker
     val bitmap = rememberDecodedImage(
         path = message.mediaPreviewPath,
         minithumbnail = message.mediaMinithumbnail,
+        // Tiles render up to ~300dp (compact album cells narrower); over-decode margin kept small.
+        targetDp = if (compact) 200 else 300,
+        // Stickers/animations can carry alpha; photos/video-thumbs are opaque JPEG previews.
+        allowRgb565 = !isStickerLike && message.mediaKind != MediaKind.Animation,
     )
     val aspectRatio = if (message.mediaWidth > 0 && message.mediaHeight > 0) {
         (message.mediaWidth.toFloat() / message.mediaHeight).coerceIn(0.65f, 1.85f)
