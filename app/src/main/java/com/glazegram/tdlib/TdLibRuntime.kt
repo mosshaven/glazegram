@@ -494,6 +494,7 @@ object TdLibRuntime {
             messageHistory.remove(evicted)
             mutableMessages.value = mutableMessages.value - evicted
             mutableHistoryLoading.value = mutableHistoryLoading.value - evicted
+            mutableHistoryInitialLoading.value = mutableHistoryInitialLoading.value - evicted
             mutableHistoryHasMore.value = mutableHistoryHasMore.value - evicted
             GlazeLog.retentionEvict(evicted, history.retainedChats())
         }
@@ -740,6 +741,7 @@ object TdLibRuntime {
         mutableChatListLoaded.value = false
         mutableMessages.value = emptyMap()
         mutableHistoryLoading.value = emptyMap()
+        mutableHistoryInitialLoading.value = emptyMap()
         mutableHistoryHasMore.value = emptyMap()
         mutableAccount.value = null
         mutableState.value = AuthUiState.Initializing
