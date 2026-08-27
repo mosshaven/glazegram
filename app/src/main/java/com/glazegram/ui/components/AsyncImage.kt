@@ -51,9 +51,12 @@ private sealed interface ImageSource {
     data class File(val path: String) : ImageSource
     data class Bytes(val data: ByteArray) : ImageSource
 
-    fun cacheKey(targetBucket: Int): String = when (this) {
-        is File -> "file:$path@$targetBucket"
-        is Bytes -> "bytes:${data.size}:${data.contentHashCode()}@$targetBucket"
+    fun cacheKey(targetBucket: Int, rgb565: Boolean): String {
+        val mode = if (rgb565) "565" else "8888"
+        return when (this) {
+            is File -> "file:$path@$targetBucket:$mode"
+            is Bytes -> "bytes:${data.size}:${data.contentHashCode()}@$targetBucket:$mode"
+        }
     }
 }
 
@@ -68,14 +71,14 @@ private fun resolveSources(path: String?, minithumbnail: ByteArray?): List<Image
  * decoded content is opaque, uses RGB_565 to halve memory; otherwise keeps ARGB_8888 so
  * transparency and color precision are preserved. Runs on the caller's (IO) dispatcher.
  */
-private fun decodeSized(source: ImageSource, targetPx: Int, allowRgb565: Boolean): ImageBitmap? {
+private fun decodeSized(source: ImageSource, decodeTargetPx: Int, allowRgb565: Boolean): ImageBitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     when (source) {
         is ImageSource.File -> BitmapFactory.decodeFile(source.path, bounds)
         is ImageSource.Bytes -> BitmapFactory.decodeByteArray(source.data, 0, source.data.size, bounds)
     }
     val opts = BitmapFactory.Options().apply {
-        inSampleSize = ImageDecodePolicy.sampleSize(bounds.outWidth, bounds.outHeight, targetPx)
+        inSampleSize = ImageDecodePolicy.sampleSize(bounds.outWidth, bounds.outHeight, decodeTargetPx)
         // RGB_565 only for clearly-opaque content; a source that may carry alpha stays ARGB_8888.
         val opaque = allowRgb565 && bounds.outMimeType == "image/jpeg"
         inPreferredConfig = if (opaque) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
@@ -99,22 +102,24 @@ fun rememberDecodedImage(
         if (targetDp <= 0) 0 else (targetDp * density).toInt()
     }
     val bucket = remember(targetPx) { ImageDecodePolicy.targetBucket(targetPx) }
+    // One bucket == one decode resolution, so a shared cache key never maps to two sample sizes.
+    val decodeTargetPx = remember(bucket) { ImageDecodePolicy.decodeTargetForBucket(bucket) }
     val sources = remember(path, minithumbnail) { resolveSources(path, minithumbnail) }
     if (sources.isEmpty()) return null
 
-    val primaryKey = sources.first().cacheKey(bucket)
+    val primaryKey = sources.first().cacheKey(bucket, allowRgb565)
     var bitmap by remember(primaryKey) { mutableStateOf(ImageMemoryCache.get(primaryKey)) }
 
-    LaunchedEffect(sources, bucket) {
+    LaunchedEffect(sources, bucket, allowRgb565) {
         if (bitmap != null) return@LaunchedEffect
         for (source in sources) {
-            val key = source.cacheKey(bucket)
+            val key = source.cacheKey(bucket, allowRgb565)
             ImageMemoryCache.get(key)?.let { cached ->
                 bitmap = cached
                 return@LaunchedEffect
             }
             val decoded = withContext(Dispatchers.IO) {
-                runCatching { decodeSized(source, targetPx, allowRgb565) }.getOrNull()
+                runCatching { decodeSized(source, decodeTargetPx, allowRgb565) }.getOrNull()
             }
             if (decoded != null) {
                 ImageMemoryCache.put(key, decoded)

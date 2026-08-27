@@ -54,6 +54,27 @@ class ImageDecodePolicyTest {
         assertEquals(1536, ImageDecodePolicy.targetBucket(10_000))
     }
 
+    @Test
+    fun sameBucketProducesOneDecodeResolutionRegardlessOfRawTarget() {
+        // 200px and 300px both map to bucket 384: they must decode a 1000x1000 source identically.
+        val b200 = ImageDecodePolicy.targetBucket((200 * 1f).toInt())
+        val b300 = ImageDecodePolicy.targetBucket((300 * 1f).toInt())
+        assertEquals(b200, b300)
+        val t200 = ImageDecodePolicy.decodeTargetForBucket(b200)
+        val t300 = ImageDecodePolicy.decodeTargetForBucket(b300)
+        assertEquals(t200, t300)
+        assertEquals(
+            ImageDecodePolicy.sampleSize(1000, 1000, t200),
+            ImageDecodePolicy.sampleSize(1000, 1000, t300),
+        )
+    }
+
+    @Test
+    fun bucketZeroDecodesNatively() {
+        // Unknown target => bucket 0 => sample size 1 (native).
+        assertEquals(1, ImageDecodePolicy.sampleSize(4000, 3000, ImageDecodePolicy.decodeTargetForBucket(0)))
+    }
+
     // ---- cache limit policy -------------------------------------------------
 
     @Test

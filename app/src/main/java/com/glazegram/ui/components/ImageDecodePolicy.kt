@@ -42,6 +42,13 @@ object ImageDecodePolicy {
         return bucket
     }
 
+    /**
+     * The single decode target for a bucket, so every target that snaps to the same bucket
+     * decodes at one resolution (and thus one cache entry stays consistent). Bucket 0 (unknown)
+     * decodes natively — [sampleSize] returns 1 for a target of 0.
+     */
+    fun decodeTargetForBucket(bucket: Int): Int = bucket
+
     /** Byte-bounded cache limit: 1/8 of heap, clamped to [CACHE_MIN_BYTES, CACHE_ABSOLUTE_CAP_BYTES]. */
     fun cacheLimitBytes(maxMemoryBytes: Long): Int {
         val fraction = maxMemoryBytes / HEAP_FRACTION
