@@ -88,6 +88,8 @@ object TdLibRuntime {
     private val basicGroups = HashMap<Long, TdApi.BasicGroup>()
     private val supergroups = HashMap<Long, TdApi.Supergroup>()
     private val onlineMemberCounts = HashMap<Long, Int>()
+    /** Process-local scope mute-for (seconds), keyed by scope; null entry = not yet fetched. */
+    private val scopeMuteFor = HashMap<NotificationPolicy.Scope, Int>()
     private val chatActions = HashMap<Long, MutableMap<String, Pair<TdApi.MessageSender, TdApi.ChatAction>>>()
     private val messageHistory = HashMap<Long, Array<TdApi.Message>>()
     private val finalizedTemporaryMessageIds = Collections.synchronizedSet(HashSet<Long>())
@@ -587,6 +589,7 @@ object TdLibRuntime {
                 preferences.edit().remove("pending_phone").apply()
                 mutableState.value = AuthUiState.Ready
                 loadCurrentUser()
+                loadScopeNotificationSettings()
                 loadChats()
             }
             is TdApi.AuthorizationStateLoggingOut -> mutableState.value = AuthUiState.LoggingOut
@@ -622,6 +625,31 @@ object TdLibRuntime {
         )
         parametersSent = true
         activeClient.send(parameters, ::handleResult, ::handleException)
+    }
+
+    /**
+     * Fetches the per-scope notification settings once at startup so effective mute state can be
+     * resolved for chats that defer to their scope (`useDefaultMuteFor == true`). Live changes
+     * arrive via [TdApi.UpdateScopeNotificationSettings].
+     */
+    private fun loadScopeNotificationSettings() {
+        val scopes = listOf(
+            NotificationPolicy.Scope.PRIVATE to TdApi.NotificationSettingsScopePrivateChats(),
+            NotificationPolicy.Scope.GROUP to TdApi.NotificationSettingsScopeGroupChats(),
+            NotificationPolicy.Scope.CHANNEL to TdApi.NotificationSettingsScopeChannelChats(),
+        )
+        for ((scope, apiScope) in scopes) {
+            send(
+                TdApi.GetScopeNotificationSettings(apiScope),
+                result = { result ->
+                    (result as? TdApi.ScopeNotificationSettings)?.let {
+                        synchronized(chatMap) { scopeMuteFor[scope] = it.muteFor }
+                        publishChats()
+                    }
+                },
+                onFailure = { },
+            )
+        }
     }
 
     private fun loadChats() {
@@ -730,6 +758,7 @@ object TdLibRuntime {
                 basicGroups.clear()
                 supergroups.clear()
                 onlineMemberCounts.clear()
+                scopeMuteFor.clear()
                 chatActions.clear()
                 messageHistory.clear()
             }
@@ -885,6 +914,17 @@ object TdLibRuntime {
                 is TdApi.UpdateChatNotificationSettings -> {
                     chatMap[update.chatId]?.notificationSettings = update.notificationSettings
                 }
+                is TdApi.UpdateScopeNotificationSettings -> {
+                    val scope = when (update.scope) {
+                        is TdApi.NotificationSettingsScopePrivateChats -> NotificationPolicy.Scope.PRIVATE
+                        is TdApi.NotificationSettingsScopeGroupChats -> NotificationPolicy.Scope.GROUP
+                        is TdApi.NotificationSettingsScopeChannelChats -> NotificationPolicy.Scope.CHANNEL
+                        else -> null
+                    }
+                    if (scope != null) {
+                        synchronized(chatMap) { scopeMuteFor[scope] = update.notificationSettings.muteFor }
+                    }
+                }
                 is TdApi.UpdateFile -> updateAvatar(update.file)
                 else -> return@withLock false
             }
@@ -993,7 +1033,17 @@ object TdLibRuntime {
                     val isOutgoing = last?.isOutgoing == true
                     val isSaved = (chat.type as? TdApi.ChatTypePrivate)?.userId?.let { it == currentUser?.id } == true ||
                         (chat.type as? TdApi.ChatTypeSecret)?.userId?.let { it == currentUser?.id } == true
-                    val isMuted = (chat.notificationSettings?.muteFor ?: 0) != 0
+                    val notificationScope = when (kind) {
+                        ChatKind.Channel -> NotificationPolicy.Scope.CHANNEL
+                        ChatKind.BasicGroup, ChatKind.Supergroup -> NotificationPolicy.Scope.GROUP
+                        ChatKind.Private, ChatKind.Secret -> NotificationPolicy.Scope.PRIVATE
+                    }
+                    val settings = chat.notificationSettings
+                    val isMuted = NotificationPolicy.isEffectivelyMuted(
+                        useDefaultMuteFor = settings?.useDefaultMuteFor != false,
+                        chatMuteFor = settings?.muteFor ?: 0,
+                        scopeMuteFor = scopeMuteFor[notificationScope],
+                    )
                     ChatSummary(
                         id = chat.id,
                         title = chat.title,
